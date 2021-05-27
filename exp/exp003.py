@@ -204,12 +204,12 @@ if __name__ == "__main__":
         "roberta-large",
         # "bert-base-cased"
     ]:
-        for lr_bert in [3e-5]:
-            for lr_fc in [1e-5]:
-                for dropout in [0]:
-                    for weight_decay in [0.1]:
+        for lr_bert in [0.5e-5, 1e-5, 2e-5, 3e-5, 5e-5]:
+            for lr_fc in [1e-5, 1e-4, 1e-3]:
+                for dropout in [0, 0.2]:
+                    for weight_decay in [0, 0.01, 0.1]:
                         try:
-                            experiment_name = f"exp001_{nlp_model_name}_lrbert{lr_bert}_lrfc{lr_fc}_dropout{dropout}"
+                            experiment_name = f"{os.path.basename(__file__)[:-3]}_{nlp_model_name}_lrbert{lr_bert}_lrfc{lr_fc}_dropout{dropout}"
                             config = Config(experiment_name=experiment_name)
                             config.lr_bert = lr_bert
                             config.lr_fc = lr_fc
