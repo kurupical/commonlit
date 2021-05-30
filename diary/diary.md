@@ -64,7 +64,8 @@ Shopeeは行き当たりばったりな実験も多かったので、計画的�
 便利になることには最初に投資したい。
 
 ## exp006
-* 予実をplotlyでmlflowに保存する
+* 予実をplotlyでmlflowに保存する?
+* UIで見る!
   * text
   * text_length
 * debertaやる
