@@ -32,12 +32,13 @@ if exp_name != "":
     exp_files = [""] + glob.glob(f"{exp_name}/*")
     exp_file = st.selectbox(label="exp_file", options=exp_files)
     if exp_file != "":
-        epochs = st.number_input(label="epoch", min_value=-1, max_value=14, step=1)
+        steps_dict = {i: x for i, x in enumerate(glob.glob(f"{exp_file}/val_fold0_step*.csv"))}
+        steps = st.number_input(label="epoch", min_value=-1, max_value=len(steps_dict), step=1)
         df = read_csv()
-        if epochs == -1:
+        if steps == -1:
             df_oof = pd.concat([pd.read_csv(x) for x in glob.glob(f"{exp_file}/val*best.csv")])
         else:
-            df_oof = pd.concat([pd.read_csv(x) for x in glob.glob(f"{exp_file}/val*epoch{epochs}.csv")])
+            df_oof = pd.read_csv(steps_dict[steps])
         df = pd.merge(df, df_oof[["id", "pred"]], how="inner")
         df["mse"] = (df["pred"] - df["target"])**2
         rmse = np.sqrt(1 / len(df.values) * df["mse"].sum())
@@ -50,7 +51,7 @@ if exp_name != "":
                          hover_name="hover_text",
                          range_x=(-4, 2),
                          range_y=(-4, 2),
-                         height=250)
+                         height=500)
         st.plotly_chart(fig)
 
         fig = px.histogram(data_frame=df,

@@ -51,8 +51,6 @@ class Config:
 
     lr_bert: float = 2e-5
     lr_fc: float = 1e-4
-    scheduler_params = {"num_warmup_steps": 16*100,
-                        "num_training_steps": 16*2500}
     if debug:
         epochs: int = 2
     else:

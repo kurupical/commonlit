@@ -69,3 +69,48 @@ Shopeeは行き当たりばったりな実験も多かったので、計画的�
   * text
   * text_length
 * debertaやる
+
+# 2021/5/30
+* dropout を有効にして何回も予測させるのはありかもしれない
+
+# 2021/5/31
+[TODO] foldを公開ノートブックと合わせる<br> ok
+[TODO] Datasetの出力をバラバラにする(stdで) <br> X
+[TODO] weight_decay をちゃんとやる<br> X
+[TODO] 英単語むずかしさの統計量 OK
+
+## exp008
+* LSTM系を1個or2個かますのを試してみたい
+-> rnn_module_dropout=0が効きそう(fold0: rmse 0.497)
+
+## EDA(001_baysian_mean_target)
+!, ?, なども特徴として効く
+
+## exp009
+* !, ?などをちゃんと1つの単語として扱うように
+
+## exp010
+* loss: rmse -> mse
+
+## exp011
+* weight_decay をちゃんとやる
+
+# 2021/6/1
+## exp012
+multidropout -> CV -5pt
+
+## exp013
+真ん中のデータだけ水増ししてみた
+
+## exp014
+lrを変える
+
+## exp015
+GPT2をためす
+
+## survey
+解法をいろいろ見る -> Jigsow をsurvey.mdに残した
+
+# 2021/6/2
+ここでfinetune_mlmを試してみる
+https://github.com/huggingface/transformers/tree/master/examples/pytorch/language-modeling
