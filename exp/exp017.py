@@ -22,6 +22,7 @@ from typing import List, Tuple
 import gc
 import pickle
 from collections import OrderedDict
+from gensim.models import KeyedVectors
 
 class CommonLitDataset(Dataset):
     def __init__(self, df, tokenizer, transforms=None):
@@ -34,16 +35,16 @@ class CommonLitDataset(Dataset):
 
     def __getitem__(self, index):
         def replace_stop_words(x):
-            x = x.replace(".", " . ")
-            x = x.replace(",", " , ")
-            x = x.replace("!", " ! ")
-            x = x.replace("?", " ? ")
-            x = x.replace("\n", " \n ")
-            x = x.replace(")", " ) ")
-            x = x.replace("(", " ( ")
-            x = x.replace('"', ' " ')
-            x = x.replace("'", " ' ")
-            x = x.replace(";", " ; ")
+            x = x.replace(".", " ")
+            x = x.replace(",", " ")
+            x = x.replace("!", " ")
+            x = x.replace("?", " ")
+            x = x.replace("\n", " ")
+            x = x.replace(")", " ")
+            x = x.replace("(", " ")
+            x = x.replace('"', ' ')
+            x = x.replace("'", " ")
+            x = x.replace(";", " ")
             x = x.replace("  ", " ")
             x = x.replace("  ", " ")
             x = x.replace("  ", " ")
@@ -61,21 +62,14 @@ class CommonLitDataset(Dataset):
         target = torch.tensor(row["target"], dtype=torch.float)
         return input_ids, attention_mask, target
 
+
 @dataclasses.dataclass
 class Config:
     experiment_name: str
     debug: bool = False
     fold: int = 0
 
-    nlp_model_name: str = "microsoft/deberta-base"
-    linear_dim: int = 128
-    dropout: float = 0.2
-    dropout_stack: float = 0.5
-    batch_size: int = 16
-
-    lr_bert: float = 3e-5
-    lr_fc: float = 1e-5
-    lr_rnn: float = 1e-4
+    lr: float = 1e-4
     num_warmup_steps: int = 16*100
     num_training_steps: int = 16*2500
     if debug:
@@ -88,12 +82,14 @@ class Config:
     weight_decay: float = 0.01
 
     rnn_module: nn.Module = nn.LSTM
+    rnn_hidden_size = 256
     rnn_module_num: int = 1
     rnn_module_dropout: float = 0
     rnn_module_activation: Any = None
-    rnn_module_shrink_ratio = 1
+    rnn_module_shrink_ratio: float = 1
 
     augmantation_range: Tuple[float, float] = (-2, -0)
+    lr_bert_decay: float = 0.98
 
 
 class LSTMModule(nn.Module):
@@ -124,11 +120,6 @@ class CommonLitModule(LightningModule):
         self.save_hyperparameters()
         self.config = config
         self.output_dir = output_dir
-        self.bert = AutoModel.from_pretrained(self.config.nlp_model_name)
-        self.tokenizer = AutoTokenizer.from_pretrained(config.nlp_model_name)
-        if "gpt" in config.nlp_model_name:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-        self.dropout_bert_stack = nn.Dropout(self.config.dropout_stack)
         self.seed = seed
         pl.seed_everything(seed)
         self.lstm = self.make_lstm_module()
@@ -151,20 +142,14 @@ class CommonLitModule(LightningModule):
 
     def make_lstm_module(self):
         ret = []
-        hidden_size = self.bert.config.hidden_size
+        hidden_size = self.config.rnn_hidden_size
 
         for i in range(self.config.rnn_module_num):
             ret.append((f"lstm_module_{i}", LSTMModule(config=self.config, hidden_size=hidden_size)))
             hidden_size = int(hidden_size * config.rnn_module_shrink_ratio)
         return nn.Sequential(OrderedDict(ret))
 
-    def forward(self, input_ids, attention_mask):
-        if "deberta" in self.config.nlp_model_name:
-            x = self.bert(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)[1]
-            x = torch.stack([self.dropout_bert_stack(x) for x in x[-4:]]).mean(dim=0)
-        else:
-            x = self.bert(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)[2]
-            x = torch.stack([self.dropout_bert_stack(x) for x in x[-4:]]).mean(dim=0)
+    def forward(self, x):
         x = self.lstm(x).mean(dim=1)
         x = self.linear(x)
 
@@ -174,15 +159,15 @@ class CommonLitModule(LightningModule):
         scheduler = self.lr_schedulers()
         scheduler.step()
 
-        input_ids, attention_mask, target = batch
-        output = self.forward(input_ids, attention_mask)
+        x, target = batch
+        output = self.forward(x)
         loss = torch.sqrt(F.mse_loss(output.flatten(), target.flatten()))
         self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
-        input_ids, attention_mask, target = batch
-        output = self.forward(input_ids, attention_mask)
+        x, target = batch
+        output = self.forward(x)
         loss = torch.sqrt(F.mse_loss(output.flatten(), target.flatten()))
         self.log('val_loss', loss, prog_bar=True)
         return output.cpu().detach().numpy().flatten(), target.cpu().detach().numpy().flatten()
@@ -234,18 +219,41 @@ class CommonLitModule(LightningModule):
         def extract_params(named_parameters, lr, weight_decay, no_decay=False):
             ret = {}
             no_decay_ary = ['bias', 'gamma', 'beta']
+
             if no_decay:
                 ret["params"] = [p for n, p in named_parameters if not any(nd in n for nd in no_decay_ary)]
-                ret["weight_decay"] = weight_decay
+                ret["weight_decay"] = 0
             else:
                 ret["params"] = [p for n, p in named_parameters if any(nd in n for nd in no_decay_ary)]
-                ret["weight_decay"] = 0
+                ret["weight_decay"] = weight_decay
             ret["lr"] = lr
             return ret
 
+        def bert_params():
+            params = []
+            no_decay_ary = ['bias', 'gamma', 'beta']
+            layers = self.bert.config.num_hidden_layers
+            for i in range(layers):
+                # models
+                # parameters
+                ret = {}
+                ret["params"] = [p for n, p in self.bert.named_parameters()
+                                 if f"encoder.layer.{i}." in n and not any(nd in n for nd in no_decay_ary)]
+                ret["weight_decay"] = self.config.weight_decay
+                ret["lr"] = self.config.lr_bert * (self.config.lr_bert_decay ** (layers - i + 1))
+                params.append(ret)
+
+                ret = {}
+                ret["params"] = [p for n, p in self.bert.named_parameters()
+                                 if f"bert.encoder.layer.{i}." in n and any(nd in n for nd in no_decay_ary)]
+                ret["weight_decay"] = 0
+                ret["lr"] = self.config.lr_bert * (self.config.lr_bert_decay ** (layers - i + 1))
+                params.append(ret)
+            return params
+
+
         params = []
-        params.append(extract_params(self.bert.named_parameters(), lr=config.lr_bert, weight_decay=config.weight_decay, no_decay=False))
-        params.append(extract_params(self.bert.named_parameters(), lr=config.lr_bert, weight_decay=0, no_decay=True))
+        params.extend(bert_params())
         params.append(extract_params(self.linear.named_parameters(), lr=config.lr_fc, weight_decay=config.weight_decay, no_decay=False))
         params.append(extract_params(self.linear.named_parameters(), lr=config.lr_fc, weight_decay=0, no_decay=True))
         params.append(extract_params(self.lstm.named_parameters(), lr=config.lr_rnn, weight_decay=config.weight_decay, no_decay=False))
@@ -307,14 +315,15 @@ def main(config: Config,
         mlflow.log_metric("rmse_mean", rmse / len(folds))
 
 if __name__ == "__main__":
-    for model in ["google/bigbird-roberta-base",
-                  "gpt2",
-                  "distilgpt2",
-                  "albert-base-v2"
-                  ]:
-        experiment_name = "lstm"
+
+    for model in ["roberta-base"]:
+        experiment_name = "LSTM Only"
         folds = [0, 1, 2, 3, 4]
 
-        config = Config(experiment_name=experiment_name)
-        config.nlp_model_name = model
-        main(config, folds)
+        for lr in [5e-5, 3e-5, 1e-4]:
+            config = Config(experiment_name=experiment_name)
+            config.nlp_model_name = model
+            config.lr = lr
+            main(config, folds=folds)
+
+

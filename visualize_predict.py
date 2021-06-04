@@ -27,16 +27,17 @@ def indent_excerpt(x):
 
 exp_names = [""] + glob.glob("output/*")
 exp_name = st.selectbox(label="exp_name", options=exp_names)
+fold = st.selectbox(label="fold", options=["", 0, 1, 2, 3, 4])
 
 if exp_name != "":
     exp_files = [""] + glob.glob(f"{exp_name}/*")
     exp_file = st.selectbox(label="exp_file", options=exp_files)
     if exp_file != "":
-        steps_dict = {i: x for i, x in enumerate(glob.glob(f"{exp_file}/val_fold0_step*.csv"))}
+        steps_dict = {i: x for i, x in enumerate(glob.glob(f"{exp_file}/val_fold{fold}*_step*.csv"))}
         steps = st.number_input(label="epoch", min_value=-1, max_value=len(steps_dict), step=1)
         df = read_csv()
         if steps == -1:
-            df_oof = pd.concat([pd.read_csv(x) for x in glob.glob(f"{exp_file}/val*best.csv")])
+            df_oof = pd.concat([pd.read_csv(x) for x in glob.glob(f"{exp_file}/val_fold{fold}*_best.csv")])
         else:
             df_oof = pd.read_csv(steps_dict[steps])
         df = pd.merge(df, df_oof[["id", "pred"]], how="inner")

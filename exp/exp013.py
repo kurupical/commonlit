@@ -153,7 +153,7 @@ class CommonLitModule(LightningModule):
 
         for i in range(self.config.rnn_module_num):
             ret.append((f"lstm_module_{i}", LSTMModule(config=self.config, hidden_size=hidden_size)))
-            hidden_size = int(hidden_size * config.rnn_module_shrink_ratio)
+            hidden_size = int(hidden_size * self.config.rnn_module_shrink_ratio)
         return nn.Sequential(OrderedDict(ret))
 
     def forward(self, input_ids, attention_mask):

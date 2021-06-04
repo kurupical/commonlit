@@ -4,3 +4,4 @@ output/
 mlruns/
 script/watch_log/
 script/.ipynb_checkpoints/
+finetuned_model/

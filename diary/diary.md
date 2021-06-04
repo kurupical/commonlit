@@ -104,6 +104,7 @@ multidropout -> CV -5pt
 
 ## exp014
 lrを変える
+-> BEST: 0.505(decay=0.99, bert=3e-5)
 
 ## exp015
 GPT2をためす
@@ -114,3 +115,42 @@ GPT2をためす
 # 2021/6/2
 ここでfinetune_mlmを試してみる
 https://github.com/huggingface/transformers/tree/master/examples/pytorch/language-modeling
+
+## exp016
+finetune_mlm (roberta)
+
+
+# 2020/6/3
+* root mean squared errorだからといって、lossをRMSEにする必要があるのか？→ない。結局mseを最小化する方がいいし、バッチサイズが小さいとRMSEは有効にならんような…
+* nn.LinearのactivationにReLU入れてたけど、これ最終層のマイナス方面予測に悪影響与えるんでは。ということで削除…
+  
+
+## exp020
+分布
+
+## exp021
+exp018 + loss=mse
+-> exp021 (fold0: 0.482)
+
+## exp022
+exp018 - tokenizer
+
+# 2020/6/4
+
+## exp024
+exp023 + activation入れない
+
+## exp025
+exp023 + 1層dense
+epochs = 6: 0.484だが、epochs = 8: 0.478
+
+スケジューラーをいじったらもうちょっといい感じになるんでは？
+
+## exp026
+exp023 + 3層dense
+
+## exp027
+exp023 + No scheduler
+
+## exp028
+exp023 + StepLR(gamma=0.5)
