@@ -72,7 +72,7 @@ class Config:
     if debug:
         epochs: int = 2
     else:
-        epochs: int = 6
+        epochs: int = 8
 
     activation: Any = nn.GELU
     optimizer: Any = AdamW
@@ -139,7 +139,7 @@ class CommonLitModule(LightningModule):
         self.linear = nn.Sequential(
             nn.Linear(hidden_size, self.cfg.linear_dim),
             nn.Dropout(self.cfg.dropout),
-            self.cfg.activation(),
+            # self.cfg.activation(),
             nn.Linear(self.cfg.linear_dim, 1)
         )
 

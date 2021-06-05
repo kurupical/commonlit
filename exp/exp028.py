@@ -347,7 +347,7 @@ if __name__ == "__main__":
     experiment_name = "fix scheduler"
     folds = [0, 1, 2, 3, 4]
 
-    for steplr_gamma in [0.2, 0.5, 0.8]:
+    for steplr_gamma in [0.25, 0.5, 0.75]:
         cfg = Config(experiment_name=experiment_name)
         cfg.steplr_gamma = steplr_gamma
         main(cfg, folds=folds)

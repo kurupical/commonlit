@@ -41,3 +41,32 @@ https://www.kaggle.com/c/jigsaw-unintended-bias-in-toxicity-classification/discu
 * RNN
 * LightGBM / Catboost (bert 768d feature)
 
+# Google QUEST Q&A Labeling
+## 1st
+https://www.kaggle.com/c/google-quest-challenge/discussion/129840
+
+* Use ALL CLS layer and learnable weight (sum=1)
+  * https://github.com/oleg-yaroshevskiy/quest_qa_labeling/blob/master/step5_model3_roberta_code/model.py#L114-L117
+  
+## 5rd
+https://www.kaggle.com/c/google-quest-challenge/discussion/129875
+* concat all CLS
+* add statistical feature
+
+## 3rd
+https://www.kaggle.com/c/google-quest-challenge/discussion/129927
+* ネットワークの構成とかたくさん書いてあるし参考になりそう
+* それぞれのNWごとに最適なものが違うのかもしれん。。。。これを見てると
+
+## 19th
+https://www.kaggle.com/c/google-quest-challenge/discussion/129895
+* バッチサイズを大きくするのは効かなかった(>16)
+* freeze
+
+## 18th
+https://www.kaggle.com/c/google-quest-challenge/discussion/130010
+* pooler + mean + min + max concats
+
+## 10th
+https://www.kaggle.com/c/google-quest-challenge/discussion/129915
+* AdamW (beta=(0.5, 0.999))

@@ -139,7 +139,7 @@ class CommonLitModule(LightningModule):
         self.linear = nn.Sequential(
             nn.Linear(hidden_size, self.cfg.linear_dim),
             nn.Dropout(self.cfg.dropout),
-            # self.cfg.activation(),
+            self.cfg.activation(),
             nn.Linear(self.cfg.linear_dim, 1)
         )
 

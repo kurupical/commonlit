@@ -72,7 +72,7 @@ class Config:
     if debug:
         epochs: int = 2
     else:
-        epochs: int = 7
+        epochs: int = 8
 
     activation: Any = nn.GELU
     optimizer: Any = AdamW
@@ -90,6 +90,8 @@ class Config:
     multi_dropout_ratio: float = 0.3
     multi_dropout_num: int = 5
     fine_tuned_path: str = "finetuned_model/roberta_base_warmup_10"
+
+    accumulate_grad_batches: int = 1
 
 class LSTMModule(nn.Module):
     def __init__(self, cfg, hidden_size):
@@ -117,79 +119,6 @@ def fix_key(state_dict):
         ret[k] = v
     return ret
 
-
-"""
-https://github.com/kuto5046/kaggle-rainforest/blob/main/src/sam.py#L16
-"""
-class SAM(torch.optim.Optimizer):
-    def __init__(self, params, base_optimizer, rho=0.05, **kwargs):
-        assert rho >= 0.0, f"Invalid rho, should be non-negative: {rho}"
-
-        defaults = dict(rho=rho, **kwargs)
-        super(SAM, self).__init__(params, defaults)
-
-        self.base_optimizer = base_optimizer(self.param_groups, **kwargs)
-        self.param_groups = self.base_optimizer.param_groups
-
-    @torch.no_grad()
-    def first_step(self, closure=None, zero_grad=False):
-        loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                try:
-                    loss = closure()
-                except:
-                    pass
-        grad_norm = self._grad_norm()
-        for group in self.param_groups:
-            scale = group["rho"] / (grad_norm + 1e-12)
-
-            for p in group["params"]:
-                if p.grad is None: continue
-                e_w = p.grad * scale.to(p)
-                p.add_(e_w)  # climb to the local maximum "w + e(w)"
-                self.state[p]["e_w"] = e_w
-
-        if zero_grad: self.zero_grad()
-        return loss
-
-    @torch.no_grad()
-    def second_step(self, closure=None, zero_grad=False):
-        loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                try:
-                    loss = closure()
-                except:
-                    pass
-        for group in self.param_groups:
-            for p in group["params"]:
-                if p.grad is None: continue
-                p.sub_(self.state[p]["e_w"])  # get back to "w" from "w + e(w)"
-
-        self.base_optimizer.step()  # do the actual "sharpness-aware" update
-
-        if zero_grad: self.zero_grad()
-        return loss
-
-    def step(self, closure=None):
-        raise NotImplementedError(
-            "SAM doesn't work like the other optimizers, you should first call `first_step` and the `second_step`; see the documentation for more info.")
-
-    def _grad_norm(self):
-        shared_device = self.param_groups[0]["params"][
-            0].device  # put everything on the same device, in case of model parallelism
-        norm = torch.norm(
-            torch.stack([
-                p.grad.norm(p=2).to(shared_device)
-                for group in self.param_groups for p in group["params"]
-                if p.grad is not None
-            ]),
-            p=2
-        )
-
-        return norm
-
 class CommonLitModule(LightningModule):
     def __init__(self,
                  cfg: Config,
@@ -212,7 +141,7 @@ class CommonLitModule(LightningModule):
         self.linear = nn.Sequential(
             nn.Linear(hidden_size, self.cfg.linear_dim),
             nn.Dropout(self.cfg.dropout),
-            # self.cfg.activation(),
+            self.cfg.activation(),
             nn.Linear(self.cfg.linear_dim, 1)
         )
 
@@ -231,11 +160,6 @@ class CommonLitModule(LightningModule):
             ret.append((f"lstm_module_{i}", LSTMModule(cfg=self.cfg, hidden_size=hidden_size)))
             hidden_size = int(hidden_size * self.cfg.rnn_module_shrink_ratio)
         return nn.Sequential(OrderedDict(ret))
-
-    def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_idx, optimizer_closure, on_tpu, using_native_amp,
-                       using_lbfgs):
-        optimizer.first_step(closure=optimizer_closure, zero_grad=True)
-        optimizer.second_step(closure=optimizer_closure, zero_grad=True)
 
     def forward(self, input_ids, attention_mask, token_type_ids):
         if "deberta" in self.cfg.nlp_model_name:
@@ -364,7 +288,7 @@ class CommonLitModule(LightningModule):
         params.append(extract_params(self.lstm.named_parameters(), lr=self.cfg.lr_rnn, weight_decay=self.cfg.weight_decay, no_decay=False))
         params.append(extract_params(self.lstm.named_parameters(), lr=self.cfg.lr_rnn, weight_decay=0, no_decay=True))
 
-        optimizer = SAM(params, self.cfg.optimizer)
+        optimizer = self.cfg.optimizer(params)
         num_warmup_steps = int(self.cfg.epochs * len(self.df_train) / self.cfg.batch_size * self.cfg.warmup_ratio)
         num_training_steps = int(self.cfg.epochs * len(self.df_train) / self.cfg.batch_size)
 
@@ -408,11 +332,12 @@ def main(cfg: Config,
                 model = CommonLitModule(cfg=cfg,
                                         output_dir=output_dir)
                 trainer = Trainer(gpus=1,
-                                  # precision=16,
+                                  precision=16,
                                   # amp_level="02",
                                   max_epochs=cfg.epochs,
                                   benchmark=True,
                                   val_check_interval=0.05,
+                                  accumulate_grad_batches=cfg.accumulate_grad_batches,
                                   progress_bar_refresh_rate=1,
                                   default_root_dir=output_dir,
                                   callbacks=[checkpoint_callback])
@@ -428,9 +353,11 @@ def main(cfg: Config,
 
 if __name__ == "__main__":
 
+
     experiment_name = "fix scheduler"
     folds = [0, 1, 2, 3, 4]
-    for lr_bert in [3e-5, 5e-5]:
+    for accumulate_grad_batches in [2, 3, 4]:
         cfg = Config(experiment_name=experiment_name)
-        cfg.lr_bert = lr_bert
+        cfg.accumulate_grad_batches = accumulate_grad_batches
         main(cfg, folds=folds)
+

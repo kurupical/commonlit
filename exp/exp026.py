@@ -355,5 +355,7 @@ if __name__ == "__main__":
 
     experiment_name = "fix scheduler"
     folds = [0, 1, 2, 3, 4]
-    cfg = Config(experiment_name=experiment_name)
-    main(cfg, folds=folds)
+    for linear_dim in [128, 256, 512]:
+        cfg = Config(experiment_name=experiment_name)
+        cfg.linear_dim = linear_dim
+        main(cfg, folds=folds)

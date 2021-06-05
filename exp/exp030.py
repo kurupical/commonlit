@@ -79,7 +79,8 @@ class Config:
     weight_decay: float = 0.1
 
     rnn_module: nn.Module = nn.LSTM
-    rnn_module_num: int = 0
+    bidirectional: bool = True
+    rnn_module_num: int = 1
     rnn_module_dropout: float = 0
     rnn_module_activation: Any = None
     rnn_module_shrink_ratio: float = 1
@@ -97,10 +98,15 @@ class LSTMModule(nn.Module):
         self.cfg = cfg
         self.hidden_size = hidden_size
         hidden_out = int(hidden_size * cfg.rnn_module_shrink_ratio)
-        self.rnn_module = self.cfg.rnn_module(hidden_size, hidden_out)
-        self.layer_norm = nn.LayerNorm(hidden_out)
-        self.rnn_module_activation = self.cfg.rnn_module_activation
-        self.dropout = nn.Dropout(self.cfg.rnn_module_dropout)
+        self.rnn_module = self.cfg.rnn_module(hidden_size, hidden_out, bidirectional=self.cfg.bidirectional)
+        if self.cfg.bidirectional:
+            self.layer_norm = nn.LayerNorm(hidden_out*2)
+            self.rnn_module_activation = self.cfg.rnn_module_activation
+            self.dropout = nn.Dropout(self.cfg.rnn_module_dropout)
+        else:
+            self.layer_norm = nn.LayerNorm(hidden_out)
+            self.rnn_module_activation = self.cfg.rnn_module_activation
+            self.dropout = nn.Dropout(self.cfg.rnn_module_dropout)
 
     def forward(self, x):
         x = self.rnn_module(x)[0]
@@ -116,79 +122,6 @@ def fix_key(state_dict):
         k = k.replace("bert.", "").replace("roberta.", "")
         ret[k] = v
     return ret
-
-
-"""
-https://github.com/kuto5046/kaggle-rainforest/blob/main/src/sam.py#L16
-"""
-class SAM(torch.optim.Optimizer):
-    def __init__(self, params, base_optimizer, rho=0.05, **kwargs):
-        assert rho >= 0.0, f"Invalid rho, should be non-negative: {rho}"
-
-        defaults = dict(rho=rho, **kwargs)
-        super(SAM, self).__init__(params, defaults)
-
-        self.base_optimizer = base_optimizer(self.param_groups, **kwargs)
-        self.param_groups = self.base_optimizer.param_groups
-
-    @torch.no_grad()
-    def first_step(self, closure=None, zero_grad=False):
-        loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                try:
-                    loss = closure()
-                except:
-                    pass
-        grad_norm = self._grad_norm()
-        for group in self.param_groups:
-            scale = group["rho"] / (grad_norm + 1e-12)
-
-            for p in group["params"]:
-                if p.grad is None: continue
-                e_w = p.grad * scale.to(p)
-                p.add_(e_w)  # climb to the local maximum "w + e(w)"
-                self.state[p]["e_w"] = e_w
-
-        if zero_grad: self.zero_grad()
-        return loss
-
-    @torch.no_grad()
-    def second_step(self, closure=None, zero_grad=False):
-        loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                try:
-                    loss = closure()
-                except:
-                    pass
-        for group in self.param_groups:
-            for p in group["params"]:
-                if p.grad is None: continue
-                p.sub_(self.state[p]["e_w"])  # get back to "w" from "w + e(w)"
-
-        self.base_optimizer.step()  # do the actual "sharpness-aware" update
-
-        if zero_grad: self.zero_grad()
-        return loss
-
-    def step(self, closure=None):
-        raise NotImplementedError(
-            "SAM doesn't work like the other optimizers, you should first call `first_step` and the `second_step`; see the documentation for more info.")
-
-    def _grad_norm(self):
-        shared_device = self.param_groups[0]["params"][
-            0].device  # put everything on the same device, in case of model parallelism
-        norm = torch.norm(
-            torch.stack([
-                p.grad.norm(p=2).to(shared_device)
-                for group in self.param_groups for p in group["params"]
-                if p.grad is not None
-            ]),
-            p=2
-        )
-
-        return norm
 
 class CommonLitModule(LightningModule):
     def __init__(self,
@@ -208,11 +141,15 @@ class CommonLitModule(LightningModule):
         self.lstm = self.make_lstm_module()
 
         # network cfg
-        hidden_size = int(self.bert.config.hidden_size * (self.cfg.rnn_module_shrink_ratio**self.cfg.rnn_module_num))
+        if self.cfg.bidirectional:
+            hidden_size = int(self.bert.config.hidden_size * (2 * self.cfg.rnn_module_shrink_ratio**self.cfg.rnn_module_num))
+        else:
+            hidden_size = int(
+                self.bert.config.hidden_size * (self.cfg.rnn_module_shrink_ratio ** self.cfg.rnn_module_num))
         self.linear = nn.Sequential(
             nn.Linear(hidden_size, self.cfg.linear_dim),
             nn.Dropout(self.cfg.dropout),
-            # self.cfg.activation(),
+            self.cfg.activation(),
             nn.Linear(self.cfg.linear_dim, 1)
         )
 
@@ -232,27 +169,15 @@ class CommonLitModule(LightningModule):
             hidden_size = int(hidden_size * self.cfg.rnn_module_shrink_ratio)
         return nn.Sequential(OrderedDict(ret))
 
-    def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_idx, optimizer_closure, on_tpu, using_native_amp,
-                       using_lbfgs):
-        optimizer.first_step(closure=optimizer_closure, zero_grad=True)
-        optimizer.second_step(closure=optimizer_closure, zero_grad=True)
-
     def forward(self, input_ids, attention_mask, token_type_ids):
         if "deberta" in self.cfg.nlp_model_name:
             x = self.bert(input_ids=input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids, output_hidden_states=True)[1]
             x = torch.stack([self.dropout_bert_stack(x) for x in x[-4:]]).mean(dim=0)
-            x = torch.sum(
-                x * attention_mask.unsqueeze(-1), dim=1, keepdim=False
-            )
-            x = x / torch.sum(attention_mask, dim=-1, keepdim=True)
         else:
             x = self.bert(input_ids=input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids, output_hidden_states=True)[2]
             x = torch.stack([self.dropout_bert_stack(x) for x in x[-4:]]).mean(dim=0)
-            x = torch.sum(
-                x * attention_mask.unsqueeze(-1), dim=1, keepdim=False
-            )
-            x = x / torch.sum(attention_mask, dim=-1, keepdim=True)
 
+        x = self.lstm(x).mean(dim=1)
         x = torch.stack([self.linear(F.dropout(x, p=self.cfg.multi_dropout_ratio, training=True))
                          for _
                          in range(self.cfg.multi_dropout_num)]).mean(dim=0)
@@ -364,7 +289,7 @@ class CommonLitModule(LightningModule):
         params.append(extract_params(self.lstm.named_parameters(), lr=self.cfg.lr_rnn, weight_decay=self.cfg.weight_decay, no_decay=False))
         params.append(extract_params(self.lstm.named_parameters(), lr=self.cfg.lr_rnn, weight_decay=0, no_decay=True))
 
-        optimizer = SAM(params, self.cfg.optimizer)
+        optimizer = self.cfg.optimizer(params)
         num_warmup_steps = int(self.cfg.epochs * len(self.df_train) / self.cfg.batch_size * self.cfg.warmup_ratio)
         num_training_steps = int(self.cfg.epochs * len(self.df_train) / self.cfg.batch_size)
 
@@ -408,7 +333,7 @@ def main(cfg: Config,
                 model = CommonLitModule(cfg=cfg,
                                         output_dir=output_dir)
                 trainer = Trainer(gpus=1,
-                                  # precision=16,
+                                  precision=16,
                                   # amp_level="02",
                                   max_epochs=cfg.epochs,
                                   benchmark=True,
@@ -430,7 +355,27 @@ if __name__ == "__main__":
 
     experiment_name = "fix scheduler"
     folds = [0, 1, 2, 3, 4]
-    for lr_bert in [3e-5, 5e-5]:
+    for bidirectional in [True]:
         cfg = Config(experiment_name=experiment_name)
-        cfg.lr_bert = lr_bert
+        cfg.bidirectional = bidirectional
+        main(cfg, folds=folds)
+
+    for rnn_module_num in [2]:
+        cfg = Config(experiment_name=experiment_name)
+        cfg.rnn_module_num = rnn_module_num
+        main(cfg, folds=folds)
+
+    for rnn_module_shrink_ratio in [0.25, 0.5]:
+        cfg = Config(experiment_name=experiment_name)
+        cfg.rnn_module_shrink_ratio = rnn_module_shrink_ratio
+        main(cfg, folds=folds)
+
+    for rnn_module_dropout in [0.2, 0.5]:
+        cfg = Config(experiment_name=experiment_name)
+        cfg.rnn_module_dropout = rnn_module_dropout
+        main(cfg, folds=folds)
+
+    for rnn_module_activation in [nn.GELU, nn.PReLU]:
+        cfg = Config(experiment_name=experiment_name)
+        cfg.rnn_module_activation = rnn_module_dropout
         main(cfg, folds=folds)

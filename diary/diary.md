@@ -154,3 +154,41 @@ exp023 + No scheduler
 
 ## exp028
 exp023 + StepLR(gamma=0.5)
+
+## exp029
+exp023 + SAM
+
+# 2021/6/5
+今日はGoogle Questの解法をサーベイする
+
+
+## pretrain: lr2.5e-5シリーズも作ってみる
+## exp030:
+exp023 + LSTMいれる, BiDirectional
+
+## exp031:
+exp023 + pretrained
+
+## exp032:
+exp030 + mean(dim=1) を最後に入れてみる -> 却下 (安定しなさすぎ)
+
+## exp033:
+exp023 + cleaning text
+
+## exp034:
+exp023 + all CLS token
+
+## exp035:
+exp023 + pooler-mean-min-max concat
+
+## exp036:
+exp023 + all hidden token - mean(exp034-like)
+
+## exp037:
+exp023 + accumurate_grad_batch
+
+## exp038:
+exp023 + small batchsize
+
+## exp039:
+exp023 + epochs = 7(exp023はepoch8だったが、いつのまにか7になっていた。。)
