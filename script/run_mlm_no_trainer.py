@@ -19,6 +19,7 @@ on a text file or a dataset without using HuggingFace Trainer.
 
 Here is the full list of checkpoints on the hub that can be fine-tuned by this script:
 https://huggingface.co/models?filter=masked-lm
+https://github.com/huggingface/transformers/blob/master/examples/pytorch/language-modeling/run_mlm_no_trainer.py
 """
 # You can also adapt this script on your own mlm task. Pointers for this are left as comments.
 
@@ -492,7 +493,6 @@ def main():
             perplexity = float("inf")
 
         logger.info(f"epoch {epoch}: perplexity: {perplexity}")
-        torch.save(model.state_dict(), f'{args.output_dir}/epoch{epoch}.pth')
 
     if args.output_dir is not None:
         accelerator.wait_for_everyone()

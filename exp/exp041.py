@@ -63,7 +63,7 @@ class Config:
     linear_dim: int = 128
     dropout: float = 0.2
     dropout_stack: float = 0.1
-    batch_size: int = 32
+    batch_size: int = 16
 
     lr_bert: float = 3e-5
     lr_fc: float = 1e-3
@@ -72,7 +72,7 @@ class Config:
     if debug:
         epochs: int = 2
     else:
-        epochs: int = 7
+        epochs: int = 8
 
     activation: Any = nn.GELU
     optimizer: Any = AdamW
@@ -167,6 +167,8 @@ class CommonLitModule(LightningModule):
                 x * attention_mask.unsqueeze(-1), dim=1, keepdim=False
             )
             x = x / torch.sum(attention_mask, dim=-1, keepdim=True)
+        elif "xlnet" in self.cfg.nlp_model_name:
+            x = self.bert(input_ids=input_ids, attention_mask=attention_mask)[0].mean(dim=1)
         else:
             x = self.bert(input_ids=input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids, output_hidden_states=True)[2]
             x = torch.stack([self.dropout_bert_stack(x) for x in x[-4:]]).mean(dim=0)
@@ -349,11 +351,9 @@ def main(cfg: Config,
         mlflow.log_metric("rmse_mean", rmse / len(folds))
 
 if __name__ == "__main__":
-
-
-    experiment_name = "fix scheduler"
+    experiment_name = "lr_bert_decay tune"
     folds = [0, 1, 2, 3, 4]
-    for epochs in [9, 10]:
+    for lr_bert_decay in [1, 0.995, 0.98]:
         cfg = Config(experiment_name=experiment_name)
-        cfg.epochs = epochs
+        cfg.lr_bert_decay = lr_bert_decay
         main(cfg, folds=folds)

@@ -42,14 +42,12 @@ class CommonLitDataset(Dataset):
                               padding="max_length",
                               max_length=256,
                               truncation=True,
-                              return_tensors="pt",
-                              return_token_type_ids=True)
+                              return_tensors="pt")
         input_ids = text["input_ids"][0]
         attention_mask = text["attention_mask"][0]
-        token_type_ids = text["token_type_ids"][0]
 
         target = torch.tensor(row["target"], dtype=torch.float)
-        return input_ids, attention_mask, token_type_ids, target
+        return input_ids, attention_mask, target
 
 
 @dataclasses.dataclass
@@ -63,7 +61,7 @@ class Config:
     linear_dim: int = 128
     dropout: float = 0.2
     dropout_stack: float = 0.1
-    batch_size: int = 32
+    batch_size: int = 16
 
     lr_bert: float = 3e-5
     lr_fc: float = 1e-3
@@ -72,7 +70,7 @@ class Config:
     if debug:
         epochs: int = 2
     else:
-        epochs: int = 7
+        epochs: int = 8
 
     activation: Any = nn.GELU
     optimizer: Any = AdamW
@@ -89,7 +87,7 @@ class Config:
 
     multi_dropout_ratio: float = 0.3
     multi_dropout_num: int = 5
-    fine_tuned_path: str = "finetuned_model/roberta_base_warmup_10"
+    fine_tuned_path: str = None
 
 class LSTMModule(nn.Module):
     def __init__(self, cfg, hidden_size):
@@ -130,6 +128,8 @@ class CommonLitModule(LightningModule):
         else:
             self.bert = AutoModel.from_pretrained(self.cfg.nlp_model_name)
         self.tokenizer = AutoTokenizer.from_pretrained(self.cfg.nlp_model_name)
+        if "gpt" in self.cfg.nlp_model_name:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
         self.dropout_bert_stack = nn.Dropout(self.cfg.dropout_stack)
         pl.seed_everything(self.cfg.seed)
         self.lstm = self.make_lstm_module()
@@ -159,16 +159,18 @@ class CommonLitModule(LightningModule):
             hidden_size = int(hidden_size * self.cfg.rnn_module_shrink_ratio)
         return nn.Sequential(OrderedDict(ret))
 
-    def forward(self, input_ids, attention_mask, token_type_ids):
+    def forward(self, input_ids, attention_mask):
         if "deberta" in self.cfg.nlp_model_name:
-            x = self.bert(input_ids=input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids, output_hidden_states=True)[1]
+            x = self.bert(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)[1]
             x = torch.stack([self.dropout_bert_stack(x) for x in x[-4:]]).mean(dim=0)
             x = torch.sum(
                 x * attention_mask.unsqueeze(-1), dim=1, keepdim=False
             )
             x = x / torch.sum(attention_mask, dim=-1, keepdim=True)
+        elif "xlnet" in self.cfg.nlp_model_name:
+            x = self.bert(input_ids=input_ids, attention_mask=attention_mask)[0].mean(dim=1)
         else:
-            x = self.bert(input_ids=input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids, output_hidden_states=True)[2]
+            x = self.bert(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)[2]
             x = torch.stack([self.dropout_bert_stack(x) for x in x[-4:]]).mean(dim=0)
             x = torch.sum(
                 x * attention_mask.unsqueeze(-1), dim=1, keepdim=False
@@ -185,15 +187,15 @@ class CommonLitModule(LightningModule):
         scheduler = self.lr_schedulers()
         scheduler.step()
 
-        input_ids, attention_mask, token_type_ids, target = batch
-        output = self.forward(input_ids, attention_mask, token_type_ids)
+        input_ids, attention_mask, target = batch
+        output = self.forward(input_ids, attention_mask)
         loss = F.mse_loss(output.flatten(), target.flatten())
         self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
-        input_ids, attention_mask, token_type_ids, target = batch
-        output = self.forward(input_ids, attention_mask, token_type_ids)
+        input_ids, attention_mask, target = batch
+        output = self.forward(input_ids, attention_mask)
         loss = F.mse_loss(output.flatten(), target.flatten())
         self.log('val_loss', loss, prog_bar=True)
         return output.cpu().detach().numpy().flatten(), target.cpu().detach().numpy().flatten()
@@ -229,7 +231,7 @@ class CommonLitModule(LightningModule):
     def setup(self, stage=None):
         df = pd.read_csv("input/commonlitreadabilityprize/train_folds.csv")
         if self.cfg.debug:
-            df = df.iloc[:100]
+            df = df.iloc[::30]
 
         self.df_train = df[df["kfold"] != self.cfg.fold].reset_index(drop=True)
         self.df_val = df[df["kfold"] == self.cfg.fold].reset_index(drop=True)
@@ -349,11 +351,14 @@ def main(cfg: Config,
         mlflow.log_metric("rmse_mean", rmse / len(folds))
 
 if __name__ == "__main__":
-
-
-    experiment_name = "fix scheduler"
+    experiment_name = "いろいろなモデル②"
     folds = [0, 1, 2, 3, 4]
-    for epochs in [9, 10]:
-        cfg = Config(experiment_name=experiment_name)
-        cfg.epochs = epochs
-        main(cfg, folds=folds)
+
+    for model in ["facebook/bart-base",
+                  "bert-base-uncased",
+                  "microsoft/deberta-base"]:
+        for lr_bert in [3e-5, 5e-5]:
+            cfg = Config(experiment_name=experiment_name)
+            cfg.lr_bert = lr_bert
+            cfg.nlp_model_name = model
+            main(cfg, folds=folds)

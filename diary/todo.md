@@ -6,9 +6,18 @@
 
 # Remove 4layers-mean and lstm
 
-# CLSを使う
-* 1層だけ
-* 全部
-* 全部(加重平均)
+# ranking 学習
 
-# cleaning text
+# BERT, ALBERT, XLNetはpretrainさせてからもう一度
+
+# warmup_scheduler, weight_decayをいじってfinetuneする
+
+# book-corpus, training_step=10000 * 5epoch
+    bert-base, albert-base, roberta-base
+
+# 単語の予測のしにくさを特徴に入れる?(perplexity)
+
+=> LGBM
+=> BERTなど　※not pretrainedなモデルに限る
+https://arxiv.org/pdf/1907.11779.pdf
+

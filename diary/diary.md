@@ -192,3 +192,29 @@ exp023 + small batchsize
 
 ## exp039:
 exp023 + epochs = 7(exp023はepoch8だったが、いつのまにか7になっていた。。)
+
+## exp040:
+いろんなモデルためす(fine_tuned_model=None)
+
+## exp041:
+exp023 + BERT lrの調整をやめる
+
+## exp042
+exp040 + tune betas
+
+# 2020/6/6
+
+## readbility
+https://arxiv.org/pdf/1907.11779.pdf
+
+## exp043
+exp040 + finetuned
+
+## exp040_2
+exp040 + warmup_ratio = 0.1
+
+## exp044
+robertaはfinetune無しで精度が出たので、こいつをいろいろいじくりまわす
+
+## exp045
+いろいろなモデル②(bert-base-uncased, )

@@ -1,0 +1,9 @@
+rem albert_base_cased_default_5_tune.bat
+call albert_base_cased_default_10_tune.bat
+call albert_base_cased_default_15_tune.bat
+call bert_base_cased_default_5_tune.bat
+call bert_base_cased_default_10_tune.bat
+call bert_base_cased_default_15_tune.bat
+call roberta_base_cased_default_5_tune.bat
+call roberta_base_cased_default_10_tune.bat
+call roberta_base_cased_default_15_tune.bat

@@ -352,11 +352,10 @@ def main(cfg: Config,
         mlflow.log_metric("rmse_mean", rmse / len(folds))
 
 if __name__ == "__main__":
-
-
     experiment_name = "fix scheduler"
     folds = [0, 1, 2, 3, 4]
-    for lr_bert in [3e-5, 5e-5]:
+    # for lr_bert in [3e-5, 5e-5]:
+    for lr_bert in [5e-5]:
         for batch_size in [8, 16]:
             cfg = Config(experiment_name=experiment_name)
             cfg.batch_size = batch_size
