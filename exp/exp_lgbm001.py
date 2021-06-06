@@ -7,6 +7,7 @@ import torch
 from transformers import AutoTokenizer, AutoModel, AutoModelForMaskedLM
 import tqdm
 import math
+import gc
 
 try:
     import mlflow
@@ -56,16 +57,18 @@ class BertPerplexityExtracter:
                               truncation=True,
                               return_tensors="pt")
 
-        input_ids = text["input_ids"][0]
 
-        perplexities = []
-        for i in range(5):
-            input_ids_masked = [x if np.random.random() > 0.15 else self.tokenizer.mask_token_id for x in input_ids]
-            input_ids_masked = torch.LongTensor(input_ids_masked).reshape(1, -1).to("cuda")
-            attention_mask = text["attention_mask"][0].reshape(1, -1).to("cuda")
-            seq_out = self.bert_model(input_ids=input_ids_masked, attention_mask=attention_mask)
-            perplexities.append(math.exp(torch.mean(seq_out[0]).cpu().detach().numpy()))
-        return perplexities
+        input_ids = text["input_ids"][0].reshape(1, -1).to("cuda")
+        attention_mask = text["attention_mask"][0].reshape(1, -1).to("cuda")
+        pred = self.bert_model(input_ids=input_ids, attention_mask=attention_mask).logits
+        loss = torch.nn.functional.cross_entropy(pred.view(-1, self.bert_model.config.vocab_size), input_ids.view(-1), reduction="none")
+        perplexity = loss.view(len(input_ids), -1).mean().detach().cpu().numpy()
+
+        del pred, loss, input_ids, attention_mask
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        return perplexity
 
 
 def replace_stop_words(x):
@@ -137,17 +140,14 @@ def feature_engineering(df):
     for i in range(bert_embeddings.shape[1]):
         df_ret[f"bert_{i}"] = bert_embeddings[:, i]
 
-    perp_path = "output/bert_perplexities.npy"
+    perp_path = "output/bert_perplexity.npy"
     if os.path.isfile(perp_path):
-        bert_perplexities = np.load(perp_path)
+        perplexity = np.load(perp_path)
     else:
         bpe = BertPerplexityExtracter()
-        bert_perplexities = np.array([get_perplexities(bpe, x) for x in tqdm.tqdm(excerpt)])
-        np.save(perp_path, bert_perplexities)
-    df_ret[f"perplexities_mean"] = np.array(bert_perplexities).mean(axis=1)
-    df_ret[f"perplexities_max"] = np.array(bert_perplexities).max(axis=1)
-    df_ret[f"perplexities_min"] = np.array(bert_perplexities).min(axis=1)
-    df_ret[f"perplexities_std"] = np.array(bert_perplexities).std(axis=1)
+        perplexity = np.array([get_perplexities(bpe, x) for x in tqdm.tqdm(excerpt)])
+        np.save(perp_path, perplexity)
+    df_ret[f"perplexity"] = perplexity
 
     for i, word in enumerate(["!", "?", "(", ")", "'", '"', ";", ".", ","]):
         df_ret[f"count_word_special_{i}"] = [x.count(word) for x in excerpt]

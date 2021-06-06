@@ -21,3 +21,4 @@
 => BERTなど　※not pretrainedなモデルに限る
 https://arxiv.org/pdf/1907.11779.pdf
 
+# カスタムスケジューラーを作る。val_rmseが低くなったらlrを下げて、そうじゃなかったら上げる、てきなやつｗ
