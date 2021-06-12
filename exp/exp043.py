@@ -56,7 +56,7 @@ class CommonLitDataset(Dataset):
 class Config:
     experiment_name: str
     seed: int = 19900222
-    debug: bool = False
+    debug: bool = True
     fold: int = 0
 
     nlp_model_name: str = "roberta-base"
@@ -358,8 +358,8 @@ if __name__ == "__main__":
     for model in [# "finetuned_model/bert_base_cased_5",
                   # "finetuned_model/bert_base_cased_10",
                   # "finetuned_model/bert_base_cased_15",
-                  "finetuned_model/bert_base_cased_5_tune",
-                  "finetuned_model/bert_base_cased_10_tune",
+                  # "finetuned_model/bert_base_cased_5_tune",
+                  # "finetuned_model/bert_base_cased_10_tune",
                   "finetuned_model/bert_base_cased_15_tune",
                   ]:
         for lr_bert in [5e-5]:

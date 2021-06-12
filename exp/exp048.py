@@ -5,7 +5,7 @@ from torch.nn import functional as F
 from pytorch_lightning.core.lightning import LightningModule
 import pandas as pd
 import dataclasses
-from transformers import AutoTokenizer, AutoModel
+from transformers import AutoTokenizer, AutoModel, AutoModelForMaskedLM
 import pytorch_lightning as pl
 from transformers import AdamW, get_linear_schedule_with_warmup
 from typing import Any
@@ -25,9 +25,10 @@ from collections import OrderedDict
 
 
 class CommonLitDataset(Dataset):
-    def __init__(self, df, tokenizer, transforms=None):
+    def __init__(self, df, tokenizer, cfg, transforms=None):
         self.df = df.reset_index()
         self.augmentations = transforms
+        self.cfg = cfg
         self.tokenizer = tokenizer
 
     def __len__(self):
@@ -42,12 +43,16 @@ class CommonLitDataset(Dataset):
                               padding="max_length",
                               max_length=256,
                               truncation=True,
-                              return_tensors="pt")
-        input_ids = text["input_ids"][0]
+                              return_tensors="pt",
+                              return_token_type_ids=True)
+        input_ids = text["input_ids"][0].detach().cpu().numpy()
+        input_ids_masked = [x if np.random.random() > self.cfg.mask_p else self.tokenizer.mask_token_id for x in input_ids]
+        input_ids_masked = torch.LongTensor(input_ids_masked).to("cuda")
         attention_mask = text["attention_mask"][0]
+        token_type_ids = text["token_type_ids"][0]
 
         target = torch.tensor(row["target"], dtype=torch.float)
-        return input_ids, attention_mask, target
+        return input_ids_masked, attention_mask, token_type_ids, input_ids, target
 
 
 @dataclasses.dataclass
@@ -89,6 +94,10 @@ class Config:
     multi_dropout_num: int = 5
     fine_tuned_path: str = None
 
+    mask_p: float = 0
+
+    perplexity_linear_dim: int = 64
+
 class LSTMModule(nn.Module):
     def __init__(self, cfg, hidden_size):
         super().__init__()
@@ -124,9 +133,9 @@ class CommonLitModule(LightningModule):
         self.cfg = cfg
         self.output_dir = output_dir
         if self.cfg.fine_tuned_path is not None:
-            self.bert = AutoModel.from_pretrained(self.cfg.fine_tuned_path)
+            self.bert = AutoModelForMaskedLM.from_pretrained(self.cfg.fine_tuned_path)
         else:
-            self.bert = AutoModel.from_pretrained(self.cfg.nlp_model_name)
+            self.bert = AutoModelForMaskedLM.from_pretrained(self.cfg.nlp_model_name)
         self.tokenizer = AutoTokenizer.from_pretrained(self.cfg.nlp_model_name)
         if "gpt" in self.cfg.nlp_model_name:
             self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -136,11 +145,19 @@ class CommonLitModule(LightningModule):
 
         # network cfg
         hidden_size = int(self.bert.config.hidden_size * (self.cfg.rnn_module_shrink_ratio**self.cfg.rnn_module_num))
-        self.linear = nn.Sequential(
-            nn.Linear(hidden_size, self.cfg.linear_dim),
+
+        self.linear_perp = nn.Sequential(
+            nn.Linear(1, self.cfg.perplexity_linear_dim),
             nn.Dropout(self.cfg.dropout),
-            self.cfg.activation(),
-            nn.Linear(self.cfg.linear_dim, 1)
+            self.cfg.activation()
+        )
+        self.linear1 = nn.Sequential(
+            nn.Linear(hidden_size+self.cfg.perplexity_linear_dim, self.cfg.linear_dim),
+            nn.Dropout(self.cfg.dropout),
+            self.cfg.activation()
+        )
+        self.linear2 = nn.Sequential(
+            nn.Linear(self.cfg.linear_dim+self.cfg.perplexity_linear_dim, 1)
         )
 
         self.df_train: pd.DataFrame
@@ -159,27 +176,40 @@ class CommonLitModule(LightningModule):
             hidden_size = int(hidden_size * self.cfg.rnn_module_shrink_ratio)
         return nn.Sequential(OrderedDict(ret))
 
-    def forward(self, input_ids, attention_mask):
-        if "deberta" in self.cfg.nlp_model_name:
-            x = self.bert(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)[1]
-            x = torch.stack([self.dropout_bert_stack(x) for x in x[-4:]]).mean(dim=0)
-            x = torch.sum(
-                x * attention_mask.unsqueeze(-1), dim=1, keepdim=False
-            )
-            x = x / torch.sum(attention_mask, dim=-1, keepdim=True)
-        elif "xlnet" in self.cfg.nlp_model_name:
-            x = self.bert(input_ids=input_ids, attention_mask=attention_mask)[0].mean(dim=1)
-        else:
-            x = self.bert(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)[2]
-            x = torch.stack([self.dropout_bert_stack(x) for x in x[-4:]]).mean(dim=0)
-            x = torch.sum(
-                x * attention_mask.unsqueeze(-1), dim=1, keepdim=False
-            )
-            x = x / torch.sum(attention_mask, dim=-1, keepdim=True)
+    def forward(self, input_ids_masked, attention_mask, token_type_ids, input_ids):
+        def f(x_in, perplexity):
+            x_out = F.dropout(x_in, p=self.cfg.multi_dropout_ratio, training=True)
+            x_out = self.linear1(torch.cat([x_out, perplexity], dim=1))
+            x_out = self.linear2(torch.cat([x_out, perplexity], dim=1))
+            return x_out
 
-        x = torch.stack([self.linear(F.dropout(x, p=self.cfg.multi_dropout_ratio, training=True))
-                         for _
-                         in range(self.cfg.multi_dropout_num)]).mean(dim=0)
+        # if "deberta" in self.cfg.nlp_model_name:
+        #     x = self.bert(input_ids=input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids, output_hidden_states=True)[1]
+        #     x = torch.stack([self.dropout_bert_stack(x) for x in x[-4:]]).mean(dim=0)
+        #     x = torch.sum(
+        #         x * attention_mask.unsqueeze(-1), dim=1, keepdim=False
+        #     )
+        #     x = x / torch.sum(attention_mask, dim=-1, keepdim=True)
+        # elif "xlnet" in self.cfg.nlp_model_name:
+        #     x = self.bert(input_ids=input_ids, attention_mask=attention_mask)[0].mean(dim=1)
+        # else:
+        if "roberta" in cfg.nlp_model_name:
+            x = self.bert.roberta(input_ids=input_ids_masked, attention_mask=attention_mask, token_type_ids=token_type_ids, output_hidden_states=True)
+            input_ids_pred = self.bert.lm_head(x[0])
+        elif "bert" in cfg.nlp_model_name:
+            x = self.bert.bert(input_ids=input_ids_masked, attention_mask=attention_mask, token_type_ids=token_type_ids, output_hidden_states=True)
+            input_ids_pred = self.bert.cls(x[0])
+        loss = torch.nn.functional.cross_entropy(input_ids_pred.view(-1, self.bert.config.vocab_size), input_ids.view(-1), reduction="none")
+        perplexity = loss.view(len(input_ids), -1).mean(dim=1).view(-1, 1)
+
+        x = torch.stack([self.dropout_bert_stack(x) for x in x[1][-4:]]).mean(dim=0)
+        x = torch.sum(
+            x * attention_mask.unsqueeze(-1), dim=1, keepdim=False
+        )
+        x = x / torch.sum(attention_mask, dim=-1, keepdim=True)
+
+        perplexity = self.linear_perp(perplexity)
+        x = torch.stack([f(x, perplexity) for _ in range(self.cfg.multi_dropout_num)]).mean(dim=0)
 
         return x
 
@@ -187,15 +217,15 @@ class CommonLitModule(LightningModule):
         scheduler = self.lr_schedulers()
         scheduler.step()
 
-        input_ids, attention_mask, target = batch
-        output = self.forward(input_ids, attention_mask)
+        input_ids_masked, attention_mask, token_type_ids, input_ids, target = batch
+        output = self.forward(input_ids_masked, attention_mask, token_type_ids, input_ids)
         loss = F.mse_loss(output.flatten(), target.flatten())
         self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
-        input_ids, attention_mask, target = batch
-        output = self.forward(input_ids, attention_mask)
+        input_ids_masked, attention_mask, token_type_ids, input_ids, target = batch
+        output = self.forward(input_ids_masked, attention_mask, token_type_ids, input_ids)
         loss = F.mse_loss(output.flatten(), target.flatten())
         self.log('val_loss', loss, prog_bar=True)
         return output.cpu().detach().numpy().flatten(), target.cpu().detach().numpy().flatten()
@@ -240,9 +270,11 @@ class CommonLitModule(LightningModule):
                                    self.df_train[(cfg.augmantation_range[0] < self.df_train["target"]) &
                                                  (self.df_train["target"] < cfg.augmantation_range[1])]])
         self.dataset_train = CommonLitDataset(df=self.df_train,
-                                              tokenizer=self.tokenizer)
+                                              tokenizer=self.tokenizer,
+                                              cfg=self.cfg)
         self.dataset_val = CommonLitDataset(df=self.df_val,
-                                            tokenizer=self.tokenizer)
+                                            tokenizer=self.tokenizer,
+                                            cfg=self.cfg)
 
     def configure_optimizers(self):
         def extract_params(named_parameters, lr, weight_decay, no_decay=False):
@@ -283,8 +315,12 @@ class CommonLitModule(LightningModule):
 
         params = []
         params.extend(bert_params())
-        params.append(extract_params(self.linear.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
-        params.append(extract_params(self.linear.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
+        params.append(extract_params(self.linear1.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
+        params.append(extract_params(self.linear1.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
+        params.append(extract_params(self.linear2.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
+        params.append(extract_params(self.linear2.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
+        params.append(extract_params(self.linear_perp.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
+        params.append(extract_params(self.linear_perp.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
         params.append(extract_params(self.lstm.named_parameters(), lr=self.cfg.lr_rnn, weight_decay=self.cfg.weight_decay, no_decay=False))
         params.append(extract_params(self.lstm.named_parameters(), lr=self.cfg.lr_rnn, weight_decay=0, no_decay=True))
 
@@ -299,13 +335,11 @@ class CommonLitModule(LightningModule):
 
     def train_dataloader(self):
         return DataLoader(self.dataset_train,
-                          batch_size=self.cfg.batch_size,
-                          pin_memory=True)
+                          batch_size=self.cfg.batch_size)
 
     def val_dataloader(self):
         return DataLoader(self.dataset_val,
-                          batch_size=self.cfg.batch_size,
-                          pin_memory=True)
+                          batch_size=self.cfg.batch_size)
 
 def main(cfg: Config,
          folds: List):
@@ -351,14 +385,38 @@ def main(cfg: Config,
         mlflow.log_metric("rmse_mean", rmse / len(folds))
 
 if __name__ == "__main__":
-    experiment_name = "いろいろなモデル②"
+    experiment_name = "perplexity"
     folds = [0, 1, 2, 3, 4]
 
-    for model in [# "facebook/bart-base",
-                  "bert-base-uncased",
-                  "microsoft/deberta-base"]:
-        for lr_bert in [3e-5, 5e-5]:
-            cfg = Config(experiment_name=experiment_name)
-            cfg.lr_bert = lr_bert
-            cfg.nlp_model_name = model
-            main(cfg, folds=folds)
+    """
+    for lr_bert in [2e-5, 4e-5]:
+        cfg = Config(experiment_name=experiment_name)
+        cfg.lr_bert = lr_bert
+        main(cfg, folds=folds)
+
+    for warmup_ratio in [0.025, 0.05]:
+        cfg = Config(experiment_name=experiment_name)
+        cfg.warmup_ratio = warmup_ratio
+        main(cfg, folds=folds)
+    for dropout in [0, 0.1, 0.5]:
+        cfg = Config(experiment_name=experiment_name)
+        cfg.dropout = dropout
+        main(cfg, folds=folds)
+
+    for dropout_stack in [0, 0.2, 0.5]:
+        cfg = Config(experiment_name=experiment_name)
+        cfg.dropout_stack = dropout_stack
+        main(cfg, folds=folds)
+    """
+
+    for nlp_model_name in ["bert-base-uncased",
+                           "bert-base-cased"]:
+        cfg = Config(experiment_name=experiment_name)
+        cfg.nlp_model_name = nlp_model_name
+        main(cfg, folds=folds)
+
+    for augmantation_range in [(-2, 0), (-1.5, -0.5)]:
+        cfg = Config(experiment_name=experiment_name)
+        cfg.augmantation_range = augmantation_range
+        main(cfg, folds=folds)
+

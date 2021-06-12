@@ -22,6 +22,7 @@ from typing import List, Tuple
 import gc
 import pickle
 from collections import OrderedDict
+from torch.nn.utils import weight_norm
 
 
 class CommonLitDataset(Dataset):
@@ -54,6 +55,100 @@ class CommonLitDataset(Dataset):
         target = torch.tensor(row["target"], dtype=torch.float)
         return input_ids_masked, attention_mask, token_type_ids, input_ids, target
 
+class LSTMModule(nn.Module):
+    def __init__(self, cfg, hidden_size):
+        super().__init__()
+        self.cfg = cfg
+        self.hidden_size = hidden_size
+        hidden_out = int(hidden_size * cfg.rnn_module_shrink_ratio)
+        self.rnn_module = self.cfg.rnn_module(hidden_size, hidden_out, bidirectional=self.cfg.bidirectional)
+        if self.cfg.bidirectional:
+            self.layer_norm = nn.LayerNorm(hidden_out*2)
+            self.rnn_module_activation = self.cfg.rnn_module_activation
+            self.dropout = nn.Dropout(self.cfg.rnn_module_dropout)
+        else:
+            self.layer_norm = nn.LayerNorm(hidden_out*2)
+            self.rnn_module_activation = self.cfg.rnn_module_activation
+            self.dropout = nn.Dropout(self.cfg.rnn_module_dropout)
+
+    def forward(self, x):
+        x = self.rnn_module(x)[0]
+        x = self.layer_norm(x)
+        x = self.dropout(x)
+        if not self.rnn_module_activation is None:
+            x = self.rnn_module_activation(x)
+        return x
+
+def fix_key(state_dict):
+    ret = {}
+    for k, v in state_dict.items():
+        k = k.replace("bert.", "").replace("roberta.", "")
+        ret[k] = v
+    return ret
+
+
+
+class Chomp1d(nn.Module):
+    def __init__(self, chomp_size):
+        super(Chomp1d, self).__init__()
+        self.chomp_size = chomp_size
+
+    def forward(self, x):
+        return x[:, :, :-self.chomp_size].contiguous()
+
+
+class TemporalBlock(nn.Module):
+    def __init__(self, n_inputs, n_outputs, kernel_size, stride, dilation, padding, dropout=0.2):
+        super(TemporalBlock, self).__init__()
+        self.conv1 = weight_norm(nn.Conv1d(n_inputs, n_outputs, kernel_size,
+                                           stride=stride, padding=(kernel_size-1)*dilation,
+                                           dilation=dilation))
+        self.chomp1 = Chomp1d(padding)
+        self.relu1 = nn.ReLU()
+        self.dropout1 = nn.Dropout(dropout)
+
+        self.conv2 = weight_norm(nn.Conv1d(n_outputs, n_outputs, kernel_size,
+                                           stride=stride, padding=(kernel_size-1)*dilation,
+                                           dilation=dilation))
+        self.chomp2 = Chomp1d(padding)
+        self.relu2 = nn.ReLU()
+        self.dropout2 = nn.Dropout(dropout)
+
+        self.net = nn.Sequential(self.conv1, self.chomp1, self.relu1, self.dropout1,
+                                 self.conv2, self.chomp2, self.relu2, self.dropout2)
+        self.downsample = nn.Conv1d(n_inputs, n_outputs, 1, padding=(kernel_size-1)*dilation) if n_inputs != n_outputs else None
+        self.relu = nn.ReLU()
+        self.init_weights()
+
+    def init_weights(self):
+        self.conv1.weight.data.normal_(0, 0.01)
+        self.conv2.weight.data.normal_(0, 0.01)
+        if self.downsample is not None:
+            self.downsample.weight.data.normal_(0, 0.01)
+
+    def forward(self, x):
+        out = self.net(x)
+        res = x if self.downsample is None else self.downsample(x)
+        return self.relu(out + res)
+
+
+class TemporalConvNet(nn.Module):
+    def __init__(self, num_inputs, num_channels, kernel_size=2, dropout=0.2):
+        super(TemporalConvNet, self).__init__()
+        layers = []
+        num_levels = len(num_channels)
+        for i in range(num_levels):
+            dilation_size = 2 ** i
+            in_channels = num_inputs if i == 0 else num_channels[i-1]
+            out_channels = num_channels[i]
+            layers += [TemporalBlock(in_channels, out_channels, kernel_size, stride=1, dilation=dilation_size,
+                                     padding=(kernel_size-1) * dilation_size, dropout=dropout)]
+
+        self.network = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.network(x)
+
 
 @dataclasses.dataclass
 class Config:
@@ -71,6 +166,7 @@ class Config:
     lr_bert: float = 3e-5
     lr_fc: float = 1e-3
     lr_rnn: float = 1e-3
+    lr_tcn: float = 1e-3
     warmup_ratio: float = 0
     if debug:
         epochs: int = 2
@@ -85,7 +181,13 @@ class Config:
     rnn_module_num: int = 0
     rnn_module_dropout: float = 0
     rnn_module_activation: Any = None
-    rnn_module_shrink_ratio: float = 1
+    rnn_module_shrink_ratio: float = 0.25
+    bidirectional: bool = True
+
+    tcn_module_enable: bool = False
+    tcn_module: nn.Module = TemporalConvNet
+    tcn_module_kernel_size: int = 2
+    tcn_module_dropout: float = 0.2
 
     augmantation_range: Tuple[float, float] = (0, 0)
     lr_bert_decay: float = 0.99
@@ -96,31 +198,8 @@ class Config:
 
     mask_p: float = 0
 
-class LSTMModule(nn.Module):
-    def __init__(self, cfg, hidden_size):
-        super().__init__()
-        self.cfg = cfg
-        self.hidden_size = hidden_size
-        hidden_out = int(hidden_size * cfg.rnn_module_shrink_ratio)
-        self.rnn_module = self.cfg.rnn_module(hidden_size, hidden_out)
-        self.layer_norm = nn.LayerNorm(hidden_out)
-        self.rnn_module_activation = self.cfg.rnn_module_activation
-        self.dropout = nn.Dropout(self.cfg.rnn_module_dropout)
+    perplexity_linear_dim: int = 64
 
-    def forward(self, x):
-        x = self.rnn_module(x)[0]
-        x = self.layer_norm(x)
-        x = self.dropout(x)
-        if not self.rnn_module_activation is None:
-            x = self.rnn_module_activation(x)
-        return x
-
-def fix_key(state_dict):
-    ret = {}
-    for k, v in state_dict.items():
-        k = k.replace("bert.", "").replace("roberta.", "")
-        ret[k] = v
-    return ret
 
 class CommonLitModule(LightningModule):
     def __init__(self,
@@ -140,16 +219,33 @@ class CommonLitModule(LightningModule):
         self.dropout_bert_stack = nn.Dropout(self.cfg.dropout_stack)
         pl.seed_everything(self.cfg.seed)
         self.lstm = self.make_lstm_module()
-
+        self.tcn = self.cfg.tcn_module(num_inputs=self.bert.config.hidden_size,
+                                       num_channels=[self.bert.config.hidden_size]*2,
+                                       kernel_size=self.cfg.tcn_module_kernel_size,
+                                       dropout=self.cfg.tcn_module_dropout)
         # network cfg
-        hidden_size = int(self.bert.config.hidden_size * (self.cfg.rnn_module_shrink_ratio**self.cfg.rnn_module_num))
+        hidden_size = self.bert.config.hidden_size
+        if self.cfg.rnn_module_num > 0:
+            if self.cfg.bidirectional:
+                hidden_size += int(self.bert.config.hidden_size * ((2*self.cfg.rnn_module_shrink_ratio)**self.cfg.rnn_module_num))
+            else:
+                hidden_size += int(self.bert.config.hidden_size * (self.cfg.rnn_module_shrink_ratio**self.cfg.rnn_module_num))
+        if self.cfg.tcn_module_enable:
+            hidden_size += self.bert.config.hidden_size
+
+        self.linear_perp = nn.Sequential(
+            nn.Linear(1, self.cfg.perplexity_linear_dim),
+            # nn.BatchNorm1d(self.cfg.perplexity_linear_dim),
+            nn.Dropout(self.cfg.dropout),
+            self.cfg.activation()
+        )
         self.linear1 = nn.Sequential(
-            nn.Linear(hidden_size+1, self.cfg.linear_dim),
+            nn.Linear(hidden_size+self.cfg.perplexity_linear_dim, self.cfg.linear_dim),
             nn.Dropout(self.cfg.dropout),
             self.cfg.activation()
         )
         self.linear2 = nn.Sequential(
-            nn.Linear(self.cfg.linear_dim+1, 1)
+            nn.Linear(self.cfg.linear_dim+self.cfg.perplexity_linear_dim, 1)
         )
 
         self.df_train: pd.DataFrame
@@ -158,6 +254,7 @@ class CommonLitModule(LightningModule):
         self.dataset_val: Dataset
 
         self.best_rmse = np.inf
+
 
     def make_lstm_module(self):
         ret = []
@@ -175,31 +272,28 @@ class CommonLitModule(LightningModule):
             x_out = self.linear2(torch.cat([x_out, perplexity], dim=1))
             return x_out
 
-        # if "deberta" in self.cfg.nlp_model_name:
-        #     x = self.bert(input_ids=input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids, output_hidden_states=True)[1]
-        #     x = torch.stack([self.dropout_bert_stack(x) for x in x[-4:]]).mean(dim=0)
-        #     x = torch.sum(
-        #         x * attention_mask.unsqueeze(-1), dim=1, keepdim=False
-        #     )
-        #     x = x / torch.sum(attention_mask, dim=-1, keepdim=True)
-        # elif "xlnet" in self.cfg.nlp_model_name:
-        #     x = self.bert(input_ids=input_ids, attention_mask=attention_mask)[0].mean(dim=1)
-        # else:
         x = self.bert.roberta(input_ids=input_ids_masked, attention_mask=attention_mask, token_type_ids=token_type_ids, output_hidden_states=True)
         input_ids_pred = self.bert.lm_head(x[0])
 
         loss = torch.nn.functional.cross_entropy(input_ids_pred.view(-1, self.bert.config.vocab_size), input_ids.view(-1), reduction="none")
         perplexity = loss.view(len(input_ids), -1).mean(dim=1).view(-1, 1)
 
-        x = torch.stack([self.dropout_bert_stack(x) for x in x[1][-4:]]).mean(dim=0)
-        x = torch.sum(
-            x * attention_mask.unsqueeze(-1), dim=1, keepdim=False
+        x_bert = torch.stack([self.dropout_bert_stack(x) for x in x[1][-4:]]).mean(dim=0)
+        x_bert = torch.sum(
+            x_bert * attention_mask.unsqueeze(-1), dim=1, keepdim=False
         )
-        x = x / torch.sum(attention_mask, dim=-1, keepdim=True)
+        x_bert = x_bert / torch.sum(attention_mask, dim=-1, keepdim=True)
+        if self.cfg.rnn_module_num > 0:
+            x_lstm = self.lstm(x[0]).mean(dim=1)
+            x_bert = torch.cat([x_bert, x_lstm], dim=1)
+        if self.cfg.tcn_module_enable:
+            x_tcn = self.tcn(x[0].permute(0, 2, 1)).mean(dim=2)
+            x_bert = torch.cat([x_bert, x_tcn], dim=1)
 
-        x = torch.stack([f(x, perplexity) for _ in range(self.cfg.multi_dropout_num)]).mean(dim=0)
+        perplexity = self.linear_perp(perplexity)
+        x_out = torch.stack([f(x_bert, perplexity) for _ in range(self.cfg.multi_dropout_num)]).mean(dim=0)
 
-        return x
+        return x_out
 
     def training_step(self, batch, batch_idx):
         scheduler = self.lr_schedulers()
@@ -307,8 +401,12 @@ class CommonLitModule(LightningModule):
         params.append(extract_params(self.linear1.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
         params.append(extract_params(self.linear2.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
         params.append(extract_params(self.linear2.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
+        params.append(extract_params(self.linear_perp.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
+        params.append(extract_params(self.linear_perp.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
         params.append(extract_params(self.lstm.named_parameters(), lr=self.cfg.lr_rnn, weight_decay=self.cfg.weight_decay, no_decay=False))
         params.append(extract_params(self.lstm.named_parameters(), lr=self.cfg.lr_rnn, weight_decay=0, no_decay=True))
+        params.append(extract_params(self.tcn.named_parameters(), lr=self.cfg.lr_tcn, weight_decay=self.cfg.weight_decay, no_decay=False))
+        params.append(extract_params(self.tcn.named_parameters(), lr=self.cfg.lr_tcn, weight_decay=0, no_decay=True))
 
         optimizer = self.cfg.optimizer(params)
         num_warmup_steps = int(self.cfg.epochs * len(self.df_train) / self.cfg.batch_size * self.cfg.warmup_ratio)
@@ -371,16 +469,23 @@ def main(cfg: Config,
         mlflow.log_metric("rmse_mean", rmse / len(folds))
 
 if __name__ == "__main__":
-    experiment_name = "perplexity"
+    experiment_name = "lstm/cnn + residual"
     folds = [0, 1, 2, 3, 4]
-    """
-    for lr_bert in [5e-5]:
+    for rnn_module in [nn.LSTM, nn.GRU]:
         cfg = Config(experiment_name=experiment_name)
-        cfg.nlp_model_name = "roberta-base"
-        cfg.lr_bert = lr_bert
+        cfg.rnn_module_num = 1
+        cfg.rnn_module = rnn_module
         main(cfg, folds=folds)
-    """
-    for mask_p in [0, 0.05, 0.1]:
+
+    for kernel_size in [2, 3, 4]:
         cfg = Config(experiment_name=experiment_name)
-        cfg.mask_p = mask_p
+        cfg.tcn_module_kernel_size = kernel_size
+        cfg.tcn_module_enable = True
         main(cfg, folds=folds)
+
+    for dropout in [0, 0.5]:
+        cfg = Config(experiment_name=experiment_name)
+        cfg.tcn_module_dropout = dropout
+        cfg.tcn_module_enable = True
+        main(cfg, folds=folds)
+

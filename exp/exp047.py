@@ -96,7 +96,7 @@ class Config:
 
     mask_p: float = 0
 
-    perplexity_linear_dim: int = 32
+    perplexity_linear_dim: int = 64
 
 class LSTMModule(nn.Module):
     def __init__(self, cfg, hidden_size):
@@ -384,6 +384,7 @@ def main(cfg: Config,
 if __name__ == "__main__":
     experiment_name = "perplexity"
     folds = [0, 1, 2, 3, 4]
+    """
     for lr_bert in [3e-5, 5e-5]:
         for perplexity_linear_dim in [8, 16, 32, 64, 128]:
             cfg = Config(experiment_name=experiment_name)
@@ -391,8 +392,8 @@ if __name__ == "__main__":
             cfg.lr_bert = lr_bert
             cfg.perplexity_linear_dim = perplexity_linear_dim
             main(cfg, folds=folds)
-
-    for mask_p in [0, 0.05, 0.1]:
+    """
+    for mask_p in [0.05, 0.1]:
         cfg = Config(experiment_name=experiment_name)
         cfg.mask_p = mask_p
         main(cfg, folds=folds)

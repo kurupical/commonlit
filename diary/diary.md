@@ -224,3 +224,68 @@ perplexity を入れる①
 
 ## exp047
 perplexity　を入れる②(linearで拡張)
+
+# 2020/6/7
+## exp048
+perplexityで実験振る
+
+## exp049
+epochs = 4, get_cosine_schedule_with_warmup
+
+## exp050
+exp047 + BN(perplexity)
+
+## exp051
+exp047 + lstm復活(cnnでもOK)
+
+## exp052
+exp051 + residual structure 
+  => CV: 0.481 (tcn_module_kernel=3)
+
+## exp053
+exp051 + tcn tuning
+
+## exp054
+max_length = 48 (そんな文章情報いらんのでは)
+
+## exp055
+48単語以降をmask -> だめ
+
+## exp056
+vocab-wise denseをしてみる
+→スコア安定していい感じ
+
+# 2020/6/9
+## exp057
+exp053+exp056の機能マージ
+
+## exp058
+attention-cnn!
+fold=0だけに絞って、まずはよさげなパラメータのあたり付け
+
+cnn_lr [1e-4, 3e-4]
+
+## exp059
+bertのattentionが出力できないか見てみる
+
+-> resnet18 / pretrained=Falseが強いか?(fold0: CV0.483)
+
+## exp060
+パラメタチューニング(attentionで)
+
+# 2021/6/10
+## exp062
+roberta-largeでいろいろ見てみる
+
+## exp063
+linear_vocabとattentionを組み合わせたい
+
+# 2021/6/11
+## exp064
+perpをmeanしない
+
+## exp065
+perpを, mask部分0にしてmean + roberta-largeでいろんなモデル作った
+
+## exp067
+perpも当てるモデルを作ってみる(roberta-baseでcv0.480出たパラメータを再現して)
