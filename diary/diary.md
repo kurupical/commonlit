@@ -287,5 +287,53 @@ perpをmeanしない
 ## exp065
 perpを, mask部分0にしてmean + roberta-largeでいろんなモデル作った
 
+# 2021/6/12
 ## exp067
 perpも当てるモデルを作ってみる(roberta-baseでcv0.480出たパラメータを再現して)
+
+## exp068
+attentionをあきらめたくない
+
+## exp069
+attention は、層ごとに平均とる(16, 12, 256, 256 -> 16, 256, 256)
+
+## exp070
+attention　をbertに
+
+## exp071
+BERTをガチ目にチューニングすることにしよう
+
+# 2021/6/13
+## memo
+* https://www.kaggle.com/c/tweet-sentiment-extraction/discussion/159245
+* attnをグラフとして扱ってみる
+  相関係数?
+  * https://www.jstage.jst.go.jp/article/neuropsychology/34/3/34_17038/_pdf/-char/ja
+
+## exp074
+exp073 + simple 1DCNN-①：last 1 ~ 4
+
+## exp075
+exp073 + simple 1D-CNN②：start + last
+
+## exp076
+exp073 + concat mean+max pooling
+
+## exp077
+exp073 + FIX LSTM(batch first)
+
+## exp078
+exp077 + start_end attn
+
+## exp080
+attn 28*28 -> いいかもしれない、けど計算時間が長すぎる
+
+## exp081
+simple 2d_CNN
+
+# 2021/6/15
+## exp085
+いろいろなモデル
+
+## exp086
+roberta-large

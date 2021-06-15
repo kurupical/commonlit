@@ -174,7 +174,7 @@ class Config:
     lr_rnn: float = 1e-3
     lr_tcn: float = 1e-3
     lr_cnn: float = 1e-3
-    warmup_ratio: float = 0
+    warmup_ratio: float = 0.05
     if debug:
         epochs: int = 2
     else:
@@ -214,8 +214,7 @@ class Config:
     max_length: int = 256
 
     hidden_stack_enable: bool = False
-    perp_enable: bool = True
-    perp_predict_enable: bool = True
+    prep_enable: bool = True
 
 class CommonLitModule(LightningModule):
     def __init__(self,
@@ -280,7 +279,7 @@ class CommonLitModule(LightningModule):
             nn.Dropout(self.cfg.dropout),
             self.cfg.activation()
         )
-        if self.cfg.perp_enable:
+        if self.cfg.prep_enable:
             self.linear1 = nn.Sequential(
                 nn.Linear(hidden_size + self.cfg.linear_perplexity_dim, self.cfg.linear_dim),
                 nn.Dropout(self.cfg.dropout),
@@ -298,13 +297,6 @@ class CommonLitModule(LightningModule):
             self.linear2 = nn.Sequential(
                 nn.Linear(self.cfg.linear_dim, 1)
             )
-
-        self.linear_perp_predict = nn.Sequential(
-            nn.Linear(hidden_size, self.cfg.linear_dim),
-            nn.Dropout(self.cfg.dropout),
-            self.cfg.activation(),
-            nn.Linear(self.cfg.linear_dim, 1)
-        )
 
         self.dropout = nn.Dropout(self.cfg.dropout_output_hidden)
         self.dropout_attn = nn.Dropout(self.cfg.dropout_attn)
@@ -343,7 +335,7 @@ class CommonLitModule(LightningModule):
                                   token_type_ids=token_type_ids,
                                   output_attentions=True,
                                   output_hidden_states=True)
-            if self.cfg.perp_enable:
+            if self.cfg.prep_enable:
                 input_ids_pred = self.bert.lm_head(x[0])
         elif "bert" in self.cfg.nlp_model_name:
             x = self.bert.bert(input_ids=input_ids_masked,
@@ -351,11 +343,11 @@ class CommonLitModule(LightningModule):
                                token_type_ids=token_type_ids,
                                output_attentions=True,
                                output_hidden_states=True)
-            if self.cfg.perp_enable:
+            if self.cfg.prep_enable:
                 input_ids_pred = self.bert.cls(x[0])
 
         # x[0]: last hidden layer, x[1]: all hidden layer, x[2]: attention matrix
-        if self.cfg.perp_enable:
+        if self.cfg.prep_enable:
             loss = torch.nn.functional.cross_entropy(input_ids_pred.view(-1, self.bert.config.vocab_size), input_ids.view(-1), reduction="none")
             perplexity = loss.view(len(input_ids), -1) * attention_mask
             perplexity = perplexity.sum(dim=1) / attention_mask.sum(dim=1)
@@ -386,35 +378,26 @@ class CommonLitModule(LightningModule):
 
         x_bert = torch.cat(x_bert, dim=1)
 
-        if self.cfg.perp_enable:
-            perp = self.linear_perp(perplexity)
-            x_out = torch.stack([f(x_bert, perp) for _ in range(self.cfg.multi_dropout_num)]).mean(dim=0)
-            perp_predict = self.linear_perp_predict(x_bert)
-            return x_out, perplexity, perp_predict
+        if self.cfg.prep_enable:
+            perplexity = self.linear_perp(perplexity)
+            x_out = torch.stack([f(x_bert, perplexity) for _ in range(self.cfg.multi_dropout_num)]).mean(dim=0)
         else:
             x_out = torch.stack([f(x_bert) for _ in range(self.cfg.multi_dropout_num)]).mean(dim=0)
-            return x_out, None, None
+        return x_out
 
     def training_step(self, batch, batch_idx):
         scheduler = self.lr_schedulers()
         scheduler.step()
 
         input_ids_masked, attention_mask, token_type_ids, input_ids, target = batch
-        output, perplexity, output_perp = self.forward(input_ids_masked, attention_mask, token_type_ids, input_ids)
+        output = self.forward(input_ids_masked, attention_mask, token_type_ids, input_ids)
         loss = F.mse_loss(output.flatten(), target.flatten())
-        if self.cfg.perp_predict_enable:
-            loss2 = F.mse_loss(output_perp.flatten(), perplexity.flatten())
-            loss += loss2
-            self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
-            self.log("train_loss_perp", loss2, on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        else:
-            self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
-
+        self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
         input_ids_masked, attention_mask, token_type_ids, input_ids, target = batch
-        output, _, _ = self.forward(input_ids_masked, attention_mask, token_type_ids, input_ids)
+        output = self.forward(input_ids_masked, attention_mask, token_type_ids, input_ids)
         loss = F.mse_loss(output.flatten(), target.flatten())
         self.log('val_loss', loss, prog_bar=True)
         return output.cpu().detach().numpy().flatten(), target.cpu().detach().numpy().flatten()
@@ -512,8 +495,6 @@ class CommonLitModule(LightningModule):
         params.append(extract_params(self.linear_perp.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
         params.append(extract_params(self.linear_vocab.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
         params.append(extract_params(self.linear_vocab.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
-        params.append(extract_params(self.linear_perp_predict.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
-        params.append(extract_params(self.linear_perp_predict.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
         params.append(extract_params(self.lstm.named_parameters(), lr=self.cfg.lr_rnn, weight_decay=self.cfg.weight_decay, no_decay=False))
         params.append(extract_params(self.lstm.named_parameters(), lr=self.cfg.lr_rnn, weight_decay=0, no_decay=True))
         params.append(extract_params(self.tcn.named_parameters(), lr=self.cfg.lr_tcn, weight_decay=self.cfg.weight_decay, no_decay=False))
@@ -593,13 +574,22 @@ def config_large(cfg: Config):
     return cfg
 
 if __name__ == "__main__":
-    experiment_name = "predict_perp"
+    experiment_name = "bert-base modeling"
     folds = [0, 1, 2, 3, 4]
 
-    cfg = Config(experiment_name=experiment_name)
-    cfg.perp_enable = True
-    cfg.perp_predict_enable = True
-    cfg.hidden_stack_enable = True
-    cfg.tcn_module_enable = True
-    main(cfg, folds=folds)
+    for nlp_model_name in ["bert-base-cased",
+                           "bert-base-uncased"]:
+        cfg = Config(experiment_name=experiment_name)
+        cfg.prep_enable = True
+        cfg.tcn_module_enable = True
+        cfg.hidden_stack_enable = True
+        cfg.nlp_model_name = nlp_model_name
+        main(cfg, folds=folds)
+
+        cfg = Config(experiment_name=experiment_name)
+        cfg.rnn_module_num = 1
+        cfg.prep_enable = True
+        cfg.hidden_stack_enable = True
+        cfg.nlp_model_name = nlp_model_name
+        main(cfg, folds=folds)
 

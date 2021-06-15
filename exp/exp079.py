@@ -62,20 +62,21 @@ class LSTMModule(nn.Module):
         self.cfg = cfg
         self.hidden_size = hidden_size
         hidden_out = int(hidden_size * cfg.rnn_module_shrink_ratio)
-        self.rnn_module = self.cfg.rnn_module(hidden_size, hidden_out, bidirectional=self.cfg.bidirectional)
+        self.rnn_module = self.cfg.rnn_module(hidden_size,
+                                              hidden_out,
+                                              bidirectional=self.cfg.bidirectional,
+                                              batch_first=True,
+                                              dropout=self.cfg.rnn_module_dropout)
         if self.cfg.bidirectional:
             self.layer_norm = nn.LayerNorm(hidden_out*2)
             self.rnn_module_activation = self.cfg.rnn_module_activation
-            self.dropout = nn.Dropout(self.cfg.rnn_module_dropout)
         else:
             self.layer_norm = nn.LayerNorm(hidden_out*2)
             self.rnn_module_activation = self.cfg.rnn_module_activation
-            self.dropout = nn.Dropout(self.cfg.rnn_module_dropout)
 
     def forward(self, x):
         x = self.rnn_module(x)[0]
         x = self.layer_norm(x)
-        x = self.dropout(x)
         if not self.rnn_module_activation is None:
             x = self.rnn_module_activation(x)
         return x
@@ -174,11 +175,13 @@ class Config:
     lr_rnn: float = 1e-3
     lr_tcn: float = 1e-3
     lr_cnn: float = 1e-3
-    warmup_ratio: float = 0
+    warmup_ratio: float = 0.05
+    training_steps_ratio: float = 1
     if debug:
         epochs: int = 2
     else:
-        epochs: int = 8
+        epochs: int = 6
+        epochs_max: int = 8
 
     activation: Any = nn.GELU
     optimizer: Any = AdamW
@@ -189,6 +192,7 @@ class Config:
     rnn_module_dropout: float = 0
     rnn_module_activation: Any = None
     rnn_module_shrink_ratio: float = 0.25
+    rnn_hidden_indice: Tuple[int] = (-1, 0)
     bidirectional: bool = True
 
     tcn_module_enable: bool = False
@@ -214,8 +218,7 @@ class Config:
     max_length: int = 256
 
     hidden_stack_enable: bool = False
-    perp_enable: bool = True
-    perp_predict_enable: bool = True
+    prep_enable: bool = True
 
 class CommonLitModule(LightningModule):
     def __init__(self,
@@ -260,9 +263,9 @@ class CommonLitModule(LightningModule):
             hidden_size += self.bert.config.hidden_size
         if self.cfg.rnn_module_num > 0:
             if self.cfg.bidirectional:
-                hidden_size += int(self.bert.config.hidden_size * ((2*self.cfg.rnn_module_shrink_ratio)**self.cfg.rnn_module_num))
+                hidden_size += int(self.bert.config.hidden_size * len(self.cfg.rnn_hidden_indice) * ((2*self.cfg.rnn_module_shrink_ratio)**self.cfg.rnn_module_num))
             else:
-                hidden_size += int(self.bert.config.hidden_size * (self.cfg.rnn_module_shrink_ratio**self.cfg.rnn_module_num))
+                hidden_size += int(self.bert.config.hidden_size * len(self.cfg.rnn_hidden_indice) * (self.cfg.rnn_module_shrink_ratio**self.cfg.rnn_module_num))
         if self.cfg.tcn_module_enable:
             hidden_size += self.bert.config.hidden_size
 
@@ -280,7 +283,7 @@ class CommonLitModule(LightningModule):
             nn.Dropout(self.cfg.dropout),
             self.cfg.activation()
         )
-        if self.cfg.perp_enable:
+        if self.cfg.prep_enable:
             self.linear1 = nn.Sequential(
                 nn.Linear(hidden_size + self.cfg.linear_perplexity_dim, self.cfg.linear_dim),
                 nn.Dropout(self.cfg.dropout),
@@ -299,13 +302,6 @@ class CommonLitModule(LightningModule):
                 nn.Linear(self.cfg.linear_dim, 1)
             )
 
-        self.linear_perp_predict = nn.Sequential(
-            nn.Linear(hidden_size, self.cfg.linear_dim),
-            nn.Dropout(self.cfg.dropout),
-            self.cfg.activation(),
-            nn.Linear(self.cfg.linear_dim, 1)
-        )
-
         self.dropout = nn.Dropout(self.cfg.dropout_output_hidden)
         self.dropout_attn = nn.Dropout(self.cfg.dropout_attn)
 
@@ -319,11 +315,14 @@ class CommonLitModule(LightningModule):
 
     def make_lstm_module(self):
         ret = []
-        hidden_size = self.bert.config.hidden_size
+        hidden_size = self.bert.config.hidden_size * len(self.cfg.rnn_hidden_indice)
 
         for i in range(self.cfg.rnn_module_num):
             ret.append((f"lstm_module_{i}", LSTMModule(cfg=self.cfg, hidden_size=hidden_size)))
-            hidden_size = int(hidden_size * self.cfg.rnn_module_shrink_ratio)
+            if self.cfg.bidirectional:
+                hidden_size = int(hidden_size * self.cfg.rnn_module_shrink_ratio * 2)
+            else:
+                hidden_size = int(hidden_size * self.cfg.rnn_module_shrink_ratio)
         return nn.Sequential(OrderedDict(ret))
 
     def forward(self, input_ids_masked, attention_mask, token_type_ids, input_ids):
@@ -343,7 +342,7 @@ class CommonLitModule(LightningModule):
                                   token_type_ids=token_type_ids,
                                   output_attentions=True,
                                   output_hidden_states=True)
-            if self.cfg.perp_enable:
+            if self.cfg.prep_enable:
                 input_ids_pred = self.bert.lm_head(x[0])
         elif "bert" in self.cfg.nlp_model_name:
             x = self.bert.bert(input_ids=input_ids_masked,
@@ -351,11 +350,11 @@ class CommonLitModule(LightningModule):
                                token_type_ids=token_type_ids,
                                output_attentions=True,
                                output_hidden_states=True)
-            if self.cfg.perp_enable:
+            if self.cfg.prep_enable:
                 input_ids_pred = self.bert.cls(x[0])
 
         # x[0]: last hidden layer, x[1]: all hidden layer, x[2]: attention matrix
-        if self.cfg.perp_enable:
+        if self.cfg.prep_enable:
             loss = torch.nn.functional.cross_entropy(input_ids_pred.view(-1, self.bert.config.vocab_size), input_ids.view(-1), reduction="none")
             perplexity = loss.view(len(input_ids), -1) * attention_mask
             perplexity = perplexity.sum(dim=1) / attention_mask.sum(dim=1)
@@ -378,7 +377,7 @@ class CommonLitModule(LightningModule):
 
         # residual feature
         if self.cfg.rnn_module_num > 0:
-            x_lstm = self.lstm(self.dropout(x[0])).mean(dim=1)
+            x_lstm = self.lstm(torch.cat([x[1][idx] for idx in self.cfg.rnn_hidden_indice], dim=2)).mean(dim=1)
             x_bert.append(x_lstm)
         if self.cfg.tcn_module_enable:
             x_tcn = self.tcn(self.dropout(x[0]).permute(0, 2, 1)).mean(dim=2)
@@ -386,35 +385,26 @@ class CommonLitModule(LightningModule):
 
         x_bert = torch.cat(x_bert, dim=1)
 
-        if self.cfg.perp_enable:
-            perp = self.linear_perp(perplexity)
-            x_out = torch.stack([f(x_bert, perp) for _ in range(self.cfg.multi_dropout_num)]).mean(dim=0)
-            perp_predict = self.linear_perp_predict(x_bert)
-            return x_out, perplexity, perp_predict
+        if self.cfg.prep_enable:
+            perplexity = self.linear_perp(perplexity)
+            x_out = torch.stack([f(x_bert, perplexity) for _ in range(self.cfg.multi_dropout_num)]).mean(dim=0)
         else:
             x_out = torch.stack([f(x_bert) for _ in range(self.cfg.multi_dropout_num)]).mean(dim=0)
-            return x_out, None, None
+        return x_out
 
     def training_step(self, batch, batch_idx):
         scheduler = self.lr_schedulers()
         scheduler.step()
 
         input_ids_masked, attention_mask, token_type_ids, input_ids, target = batch
-        output, perplexity, output_perp = self.forward(input_ids_masked, attention_mask, token_type_ids, input_ids)
+        output = self.forward(input_ids_masked, attention_mask, token_type_ids, input_ids)
         loss = F.mse_loss(output.flatten(), target.flatten())
-        if self.cfg.perp_predict_enable:
-            loss2 = F.mse_loss(output_perp.flatten(), perplexity.flatten())
-            loss += loss2
-            self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
-            self.log("train_loss_perp", loss2, on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        else:
-            self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
-
+        self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
         input_ids_masked, attention_mask, token_type_ids, input_ids, target = batch
-        output, _, _ = self.forward(input_ids_masked, attention_mask, token_type_ids, input_ids)
+        output = self.forward(input_ids_masked, attention_mask, token_type_ids, input_ids)
         loss = F.mse_loss(output.flatten(), target.flatten())
         self.log('val_loss', loss, prog_bar=True)
         return output.cpu().detach().numpy().flatten(), target.cpu().detach().numpy().flatten()
@@ -504,6 +494,12 @@ class CommonLitModule(LightningModule):
 
         params = []
         params.extend(bert_params())
+        if "roberta" in self.cfg.nlp_model_name:
+            params.append({"params": self.bert.lm_head.parameters(), "weight_decay": self.cfg.weight_decay, "lr": self.cfg.lr_bert})
+        elif "bert" in self.cfg.nlp_model_name:
+            params.append({"params": self.bert.cls.parameters(), "weight_decay": self.cfg.weight_decay, "lr": self.cfg.lr_bert})
+        else:
+            raise ValueError("mask用のparameterありません")
         params.append(extract_params(self.linear1.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
         params.append(extract_params(self.linear1.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
         params.append(extract_params(self.linear2.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
@@ -512,8 +508,6 @@ class CommonLitModule(LightningModule):
         params.append(extract_params(self.linear_perp.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
         params.append(extract_params(self.linear_vocab.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
         params.append(extract_params(self.linear_vocab.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
-        params.append(extract_params(self.linear_perp_predict.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
-        params.append(extract_params(self.linear_perp_predict.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
         params.append(extract_params(self.lstm.named_parameters(), lr=self.cfg.lr_rnn, weight_decay=self.cfg.weight_decay, no_decay=False))
         params.append(extract_params(self.lstm.named_parameters(), lr=self.cfg.lr_rnn, weight_decay=0, no_decay=True))
         params.append(extract_params(self.tcn.named_parameters(), lr=self.cfg.lr_tcn, weight_decay=self.cfg.weight_decay, no_decay=False))
@@ -522,8 +516,8 @@ class CommonLitModule(LightningModule):
         params.append(extract_params(self.convnet.named_parameters(), lr=self.cfg.lr_cnn, weight_decay=0, no_decay=True))
 
         optimizer = self.cfg.optimizer(params)
-        num_warmup_steps = int(self.cfg.epochs * len(self.df_train) / self.cfg.batch_size * self.cfg.warmup_ratio)
-        num_training_steps = int(self.cfg.epochs * len(self.df_train) / self.cfg.batch_size)
+        num_warmup_steps = int(self.cfg.epochs_max * len(self.df_train) / self.cfg.batch_size * self.cfg.warmup_ratio)
+        num_training_steps = int(self.cfg.epochs_max * len(self.df_train) / self.cfg.batch_size) * self.cfg.training_steps_ratio
 
         scheduler = get_linear_schedule_with_warmup(optimizer,
                                                     num_warmup_steps=num_warmup_steps,
@@ -593,13 +587,98 @@ def config_large(cfg: Config):
     return cfg
 
 if __name__ == "__main__":
-    experiment_name = "predict_perp"
+    experiment_name = "param_tune"
     folds = [0, 1, 2, 3, 4]
 
+    # dropout tune
+    """
+    for dropout in [0.1, 0.2, 0.5]:
+        cfg = Config(experiment_name=experiment_name)
+        cfg.rnn_module_num = 1
+        cfg.dropout = dropout
+        cfg.prep_enable = True
+        cfg.hidden_stack_enable = True
+        main(cfg, folds=folds)
+
+    for lr_rnn in [1e-5, 1e-4, 5e-4]:
+        cfg = Config(experiment_name=experiment_name)
+        cfg.rnn_module_num = 1
+        cfg.lr_rnn = lr_rnn
+        cfg.prep_enable = True
+        cfg.hidden_stack_enable = True
+        main(cfg, folds=folds)
+    # epoch(scheduler) tune
+    for epochs_max in [10, 12, 15]:
+        cfg = Config(experiment_name=experiment_name)
+        cfg.rnn_module_num = 1
+        cfg.epochs_max = epochs_max
+        cfg.prep_enable = True
+        cfg.hidden_stack_enable = True
+        main(cfg, folds=folds)
+    # other models
+    for nlp_model in ["bert-base-cased",
+                      "bert-base-uncased"]:
+        cfg = Config(experiment_name=experiment_name)
+        cfg.rnn_module_num = 1
+        cfg.nlp_model_name = nlp_model
+        cfg.prep_enable = True
+        cfg.hidden_stack_enable = True
+        main(cfg, folds=folds)
+    """
+
+    for linear_perplexity_dim in [32, 128]:
+        cfg = Config(experiment_name=experiment_name)
+        cfg.rnn_module_num = 1
+        cfg.linear_perplexity_dim = linear_perplexity_dim
+        cfg.prep_enable = True
+        cfg.hidden_stack_enable = True
+        main(cfg, folds=folds)
+
+    for multi_dropout_ratio in [0.1, 0.2, 0.5]:
+        cfg = Config(experiment_name=experiment_name)
+        cfg.rnn_module_num = 1
+        cfg.multi_dropout_ratio = multi_dropout_ratio
+        cfg.prep_enable = True
+        cfg.hidden_stack_enable = True
+        main(cfg, folds=folds)
+
+    for augmantation_range in [(-2, -0.5), (-1.5, -1)]:
+        cfg = Config(experiment_name=experiment_name)
+        cfg.rnn_module_num = 1
+        cfg.augmantation_range = augmantation_range
+        cfg.prep_enable = True
+        cfg.hidden_stack_enable = True
+        main(cfg, folds=folds)
+
+    # +vocab_dim
     cfg = Config(experiment_name=experiment_name)
-    cfg.perp_enable = True
-    cfg.perp_predict_enable = True
+    cfg.rnn_module_num = 1
+    cfg.linear_perplexity_dim = linear_perplexity_dim
+    cfg.linear_vocab_enable = True
+    cfg.prep_enable = True
     cfg.hidden_stack_enable = True
+    main(cfg, folds=folds)
+
+    # +CNN
+    cfg = Config(experiment_name=experiment_name)
+    cfg.rnn_module_num = 1
     cfg.tcn_module_enable = True
+    cfg.prep_enable = True
+    cfg.hidden_stack_enable = True
+    main(cfg, folds=folds)
+
+    # -prep
+    cfg = Config(experiment_name=experiment_name)
+    cfg.rnn_module_num = 1
+    cfg.prep_enable = False
+    cfg.hidden_stack_enable = True
+    main(cfg, folds=folds)
+
+    # large
+    cfg = Config(experiment_name=experiment_name)
+    cfg.rnn_module_num = 1
+    config_large(cfg)
+    cfg.prep_enable = True
+    cfg.hidden_stack_enable = True
     main(cfg, folds=folds)
 
