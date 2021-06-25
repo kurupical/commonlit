@@ -179,6 +179,7 @@ class Config:
     training_steps_ratio: float = 1
     if debug:
         epochs: int = 2
+        epochs_max: int = 8
     else:
         epochs: int = 6
         epochs_max: int = 8
@@ -218,7 +219,7 @@ class Config:
     max_length: int = 256
 
     hidden_stack_enable: bool = False
-    prep_enable: bool = True
+    prep_enable: bool = False
 
 class CommonLitModule(LightningModule):
     def __init__(self,
@@ -336,7 +337,23 @@ class CommonLitModule(LightningModule):
                 x_out = self.linear2(x_out)
             return x_out
 
-        if "roberta" in self.cfg.nlp_model_name:
+        if "funnel" in self.cfg.nlp_model_name:
+            x = self.bert.funnel(input_ids=input_ids_masked,
+                                 attention_mask=attention_mask,
+                                 token_type_ids=token_type_ids,
+                                 output_attentions=True,
+                                 output_hidden_states=True)
+            if self.cfg.prep_enable:
+                input_ids_pred = self.bert.lm_head(x[0])
+        elif "albert" in self.cfg.nlp_model_name:
+            x = self.bert.albert(input_ids=input_ids_masked,
+                                 attention_mask=attention_mask,
+                                 token_type_ids=token_type_ids,
+                                 output_attentions=True,
+                                 output_hidden_states=True)
+            if self.cfg.prep_enable:
+                input_ids_pred = self.bert.predictions(x[0])
+        elif "roberta" in self.cfg.nlp_model_name and "bigbird" not in self.cfg.nlp_model_name:
             x = self.bert.roberta(input_ids=input_ids_masked,
                                   attention_mask=attention_mask,
                                   token_type_ids=token_type_ids,
@@ -344,7 +361,8 @@ class CommonLitModule(LightningModule):
                                   output_hidden_states=True)
             if self.cfg.prep_enable:
                 input_ids_pred = self.bert.lm_head(x[0])
-        elif "bert" in self.cfg.nlp_model_name:
+
+        elif "bert" in self.cfg.nlp_model_name or "bigbird" in self.cfg.nlp_model_name:
             x = self.bert.bert(input_ids=input_ids_masked,
                                attention_mask=attention_mask,
                                token_type_ids=token_type_ids,
@@ -368,12 +386,18 @@ class CommonLitModule(LightningModule):
             xx = torch.cat([self.dropout_attn(xx) for xx in x[2]], dim=1)
             x_bert.append(self.convnet(xx))
         if self.cfg.hidden_stack_enable:
-            xx = torch.stack([self.dropout_bert_stack(xx) for xx in x[1][-4:]]).mean(dim=0)
-            xx = torch.sum(
-                xx * attention_mask.unsqueeze(-1), dim=1, keepdim=False
-            )
-            xx = xx / torch.sum(attention_mask, dim=-1, keepdim=True)
-            x_bert.append(xx)
+            if "albert" in self.cfg.nlp_model_name:
+                x_bert.append(x[0].mean(dim=1))
+            else:
+                if "funnel" in self.cfg.nlp_model_name:
+                    xx = torch.stack([self.dropout_bert_stack(xx) for xx in x[1][-3:]]).mean(dim=0)
+                else:
+                    xx = torch.stack([self.dropout_bert_stack(xx) for xx in x[1][-4:]]).mean(dim=0)
+                xx = torch.sum(
+                    xx * attention_mask.unsqueeze(-1), dim=1, keepdim=False
+                )
+                xx = xx / torch.sum(attention_mask, dim=-1, keepdim=True)
+                x_bert.append(xx)
 
         # residual feature
         if self.cfg.rnn_module_num > 0:
@@ -593,63 +617,39 @@ def config_large(cfg: Config, nlp_model_name: str):
 
 
 if __name__ == "__main__":
-    experiment_name = "bert-base tuninga"
+    experiment_name = "roberta-large tune"
     folds = [0, 1, 2, 3, 4]
 
-    """
-    # other models
-    for lr_bert in [5e-5]:
-        cfg = Config(experiment_name=experiment_name)
-        cfg.rnn_module_num = 1
-        cfg.lr_bert = lr_bert
-        cfg.prep_enable = True
-        cfg.hidden_stack_enable = True
-        main(cfg, folds=folds)
+    for mask_p in [0.1, 0.2, 0.3]:
+        for nlp_model_name in ["bert-base-cased",
+                               "bert-base-uncased",
+                               "roberta-base"]:
+            # baseline
+            cfg = Config(experiment_name=experiment_name)
+            cfg.prep_enable = True
+            cfg.hidden_stack_enable = True
+            cfg.mask_p = mask_p
+            main(cfg, folds=folds)
 
-    for lr_bert_decay in [0.95, 0.98, 1]:
-        cfg = Config(experiment_name=experiment_name)
-        cfg.rnn_module_num = 1
-        cfg.lr_bert_decay = lr_bert_decay
-        cfg.prep_enable = True
-        cfg.hidden_stack_enable = True
-        main(cfg, folds=folds)
-    # +CNN
-    cfg = Config(experiment_name=experiment_name)
-    cfg.rnn_module_num = 1
-    cfg.tcn_module_enable = True
-    cfg.prep_enable = True
-    cfg.hidden_stack_enable = True
-    main(cfg, folds=folds)
+    for model in ["finetuned_model/bert_base_cased_5",
+                  "finetuned_model/bert_base_cased_10",
+                  "finetuned_model/bert_base_cased_15"]:
+        for lr_bert in [2e-5, 5e-5]:
+            cfg = Config(experiment_name=experiment_name)
+            cfg.hidden_stack_enable = True
+            cfg.fine_tuned_path = model
+            cfg.lr_bert = lr_bert
+            cfg.nlp_model_name = "bert-base-cased"
+            main(cfg, folds=folds)
 
-    # -prep
-    cfg = Config(experiment_name=experiment_name)
-    cfg.rnn_module_num = 1
-    cfg.prep_enable = False
-    cfg.hidden_stack_enable = True
-    main(cfg, folds=folds)
-
-    # vocab = True
-    cfg = Config(experiment_name=experiment_name)
-    cfg.rnn_module_num = 1
-    cfg.linear_vocab_enable = True
-    cfg.hidden_stack_enable = True
-    main(cfg, folds=folds)
-
-    # attention = True
-    cfg = Config(experiment_name=experiment_name)
-    cfg.rnn_module_num = 1
-    cfg.self_attention_enable = True
-    cfg.hidden_stack_enable = True
-    main(cfg, folds=folds)
-    """
-
-    # all = True
-    cfg = Config(experiment_name=experiment_name)
-    cfg.rnn_module_num = 1
-    cfg.self_attention_enable = True
-    cfg.tcn_module_enable = True
-    cfg.linear_vocab_enable = True
-    cfg.hidden_stack_enable = True
-    main(cfg, folds=folds)
-
-
+    for model in ["finetuned_model/albert_base_v2_5",
+                  "finetuned_model/albert_base_v2_10",
+                  "finetuned_model/albert_base_v2_5_tune",
+                  "finetuned_model/albert_base_v2_10_tune"]:
+        for lr_bert in [2e-5, 5e-5]:
+            cfg = Config(experiment_name=experiment_name)
+            cfg.hidden_stack_enable = True
+            cfg.fine_tuned_path = model
+            cfg.lr_bert = lr_bert
+            cfg.nlp_model_name = "albert-base-v2"
+            main(cfg, folds=folds)

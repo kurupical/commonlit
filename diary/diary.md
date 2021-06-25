@@ -337,3 +337,62 @@ simple 2d_CNN
 
 ## exp086
 roberta-large
+
+# 2021/6/17
+## exp089
+deberta tuning
+
+# 2021/6/18
+## exp090 
+bert-base tune
+linear_dim=1024がアンサンブルに一番効いてる
+→roberta-base, largeもこれで作ってみる?
+
+単純な"精度"だと、dropoutをすべて0.5にしたのが一番よかった
+
+## exp091
+linear_dim=1024
+bert-base-uncased, roberta-base, large
+
+# 2021/6/20
+## exp096
+attention: ゼロ埋め->Resize(256,256)
+
+## exp097
+1dconv for stack
+
+## exp098
+1dconv*2 for stack (ぼつ)
+
+## exp099
++std
+
+## exp100
+exp099 + 最近のモデル
+
+# 2021/6/21
+これを読む　→　https://arxiv.org/pdf/2006.05987.pdf
+
+本家コード
+https://github.com/asappresearch/revisit-bert-finetuning
+
+記事にできるようにまとめるか。。。
+
+## exp104
+randomly initializeをやってみる
+hidden_bert only
+
+# 2021/6/22
+## exp107
+pooler_enable=True
+
+# 2021/6/23
+## exp111
+CNN/LSTM(word方向に)
+
+## exp112
+attention_pool_enable(only)
+final_dimをいくつかチューニングし、fold=0であたり付けする
+
+## exp113
+conv2D(kernel_size=(1, 1))を試してみる

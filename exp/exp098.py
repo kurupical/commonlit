@@ -159,11 +159,12 @@ class Config:
     debug: bool = False
     fold: int = 0
 
-    nlp_model_name: str = "bert-base-cased"
+    nlp_model_name: str = "roberta-base"
     linear_dim: int = 128
     linear_vocab_dim_1: int = 64
     linear_vocab_dim: int = 16
     linear_perplexity_dim: int = 64
+    linear_final_dim: int = 128
     dropout: float = 0.2
     dropout_stack: float = 0.1
     dropout_output_hidden: float = 0.2
@@ -179,6 +180,7 @@ class Config:
     training_steps_ratio: float = 1
     if debug:
         epochs: int = 2
+        epochs_max: int = 8
     else:
         epochs: int = 6
         epochs_max: int = 8
@@ -220,6 +222,9 @@ class Config:
     hidden_stack_enable: bool = False
     prep_enable: bool = True
 
+    conv1d_kernel_size: int = 3
+    dropout_conv1d: float = 0.2
+
 class CommonLitModule(LightningModule):
     def __init__(self,
                  cfg: Config,
@@ -256,18 +261,15 @@ class CommonLitModule(LightningModule):
         # network cfg
         hidden_size = 0
         if self.cfg.linear_vocab_enable:
-            hidden_size += self.cfg.linear_vocab_dim * self.cfg.max_length
+            hidden_size += self.cfg.linear_final_dim
         if self.cfg.self_attention_enable:
-            hidden_size += self.convnet.num_features
+            hidden_size += self.cfg.linear_final_dim
         if self.cfg.hidden_stack_enable:
-            hidden_size += self.bert.config.hidden_size
+            hidden_size += self.cfg.linear_final_dim
         if self.cfg.rnn_module_num > 0:
-            if self.cfg.bidirectional:
-                hidden_size += int(self.bert.config.hidden_size * len(self.cfg.rnn_hidden_indice) * ((2*self.cfg.rnn_module_shrink_ratio)**self.cfg.rnn_module_num))
-            else:
-                hidden_size += int(self.bert.config.hidden_size * len(self.cfg.rnn_hidden_indice) * (self.cfg.rnn_module_shrink_ratio**self.cfg.rnn_module_num))
+            hidden_size += self.cfg.linear_final_dim
         if self.cfg.tcn_module_enable:
-            hidden_size += self.bert.config.hidden_size
+            hidden_size += self.cfg.linear_final_dim
 
         self.linear_perp = nn.Sequential(
             nn.Linear(1, self.cfg.linear_perplexity_dim),
@@ -283,9 +285,60 @@ class CommonLitModule(LightningModule):
             nn.Dropout(self.cfg.dropout),
             self.cfg.activation()
         )
+
+        self.linear_vocab_final = nn.Sequential(
+            nn.Linear(self.cfg.linear_vocab_dim*self.cfg.max_length, self.cfg.linear_final_dim),
+            # nn.BatchNorm1d(self.cfg.linear_final_dim),
+            self.cfg.activation(),
+            nn.Dropout(self.cfg.dropout)
+        )
+        self.linear_conv_final = nn.Sequential(
+            nn.Linear(self.convnet.num_features, self.cfg.linear_final_dim),
+            # nn.BatchNorm1d(self.cfg.linear_final_dim),
+            self.cfg.activation(),
+            nn.Dropout(self.cfg.dropout)
+        )
+        self.linear_hidden_final = nn.Sequential(
+            nn.Linear(self.bert.config.hidden_size, self.cfg.linear_final_dim),
+            # nn.BatchNorm1d(self.cfg.linear_final_dim),
+            self.cfg.activation(),
+            nn.Dropout(self.cfg.dropout)
+        )
+        if self.cfg.bidirectional:
+            lstm_size = int(self.bert.config.hidden_size * len(self.cfg.rnn_hidden_indice) * (
+                        (2 * self.cfg.rnn_module_shrink_ratio) ** self.cfg.rnn_module_num))
+        else:
+            lstm_size = int(self.bert.config.hidden_size * len(self.cfg.rnn_hidden_indice) * (
+                        self.cfg.rnn_module_shrink_ratio ** self.cfg.rnn_module_num))
+
+        self.linear_lstm_final = nn.Sequential(
+            nn.Linear(lstm_size, self.cfg.linear_final_dim),
+            # nn.BatchNorm1d(self.cfg.linear_final_dim),
+            self.cfg.activation(),
+            nn.Dropout(self.cfg.dropout)
+        )
+
+        self.linear_tcn_final = nn.Sequential(
+            nn.Linear(self.bert.config.hidden_size, self.cfg.linear_final_dim),
+            # nn.BatchNorm1d(self.cfg.linear_final_dim),
+            self.cfg.activation(),
+            nn.Dropout(self.cfg.dropout)
+        )
+
+        self.conv1d = nn.Sequential(
+            nn.Conv1d(self.cfg.linear_final_dim, self.cfg.linear_final_dim*2,
+                      kernel_size=self.cfg.conv1d_kernel_size),
+            # nn.LeakyReLU(),
+            # nn.Dropout(self.cfg.dropout_conv1d),
+            nn.Conv1d(self.cfg.linear_final_dim*2, self.cfg.linear_final_dim*2,
+                      kernel_size=self.cfg.conv1d_kernel_size),
+            # nn.LeakyReLU(),
+            # nn.Dropout(self.cfg.dropout_conv1d),
+        )
+
         if self.cfg.prep_enable:
             self.linear1 = nn.Sequential(
-                nn.Linear(hidden_size + self.cfg.linear_perplexity_dim, self.cfg.linear_dim),
+                nn.Linear(self.cfg.linear_final_dim*2 + self.cfg.linear_perplexity_dim, self.cfg.linear_dim),
                 nn.Dropout(self.cfg.dropout),
                 self.cfg.activation()
             )
@@ -294,7 +347,7 @@ class CommonLitModule(LightningModule):
             )
         else:
             self.linear1 = nn.Sequential(
-                nn.Linear(hidden_size, self.cfg.linear_dim),
+                nn.Linear(self.cfg.linear_final_dim*2, self.cfg.linear_dim),
                 nn.Dropout(self.cfg.dropout),
                 self.cfg.activation()
             )
@@ -336,7 +389,31 @@ class CommonLitModule(LightningModule):
                 x_out = self.linear2(x_out)
             return x_out
 
-        if "roberta" in self.cfg.nlp_model_name:
+        if "funnel" in self.cfg.nlp_model_name:
+            x = self.bert.funnel(input_ids=input_ids_masked,
+                                 attention_mask=attention_mask,
+                                 token_type_ids=token_type_ids,
+                                 output_attentions=True,
+                                 output_hidden_states=True)
+            if self.cfg.prep_enable:
+                input_ids_pred = self.bert.lm_head(x[0])
+        elif "albert" in self.cfg.nlp_model_name:
+            x = self.bert.albert(input_ids=input_ids_masked,
+                                 attention_mask=attention_mask,
+                                 token_type_ids=token_type_ids,
+                                 output_attentions=True,
+                                 output_hidden_states=True)
+            if self.cfg.prep_enable:
+                input_ids_pred = self.bert.predictions(x[0])
+        elif "deberta" in self.cfg.nlp_model_name:
+            x = self.bert.deberta(input_ids=input_ids_masked,
+                                  attention_mask=attention_mask,
+                                  token_type_ids=token_type_ids,
+                                  output_attentions=True,
+                                  output_hidden_states=True)
+            if self.cfg.prep_enable:
+                input_ids_pred = self.bert.cls(x[0])
+        elif "roberta" in self.cfg.nlp_model_name and "bigbird" not in self.cfg.nlp_model_name:
             x = self.bert.roberta(input_ids=input_ids_masked,
                                   attention_mask=attention_mask,
                                   token_type_ids=token_type_ids,
@@ -344,7 +421,8 @@ class CommonLitModule(LightningModule):
                                   output_hidden_states=True)
             if self.cfg.prep_enable:
                 input_ids_pred = self.bert.lm_head(x[0])
-        elif "bert" in self.cfg.nlp_model_name:
+
+        elif "bert" in self.cfg.nlp_model_name or "bigbird" in self.cfg.nlp_model_name:
             x = self.bert.bert(input_ids=input_ids_masked,
                                attention_mask=attention_mask,
                                token_type_ids=token_type_ids,
@@ -363,28 +441,40 @@ class CommonLitModule(LightningModule):
         # base feature
         x_bert = []
         if self.cfg.linear_vocab_enable:
-            x_bert.append(self.dropout(self.linear_vocab(x[0]).view(len(input_ids), -1)))
+            xx = self.dropout(self.linear_vocab(x[0]).view(len(input_ids), -1))
+            x_bert.append(self.linear_vocab_final(xx))
         if self.cfg.self_attention_enable:
             xx = torch.cat([self.dropout_attn(xx) for xx in x[2]], dim=1)
-            x_bert.append(self.convnet(xx))
-        if self.cfg.hidden_stack_enable:
-            xx = torch.stack([self.dropout_bert_stack(xx) for xx in x[1][-4:]]).mean(dim=0)
-            xx = torch.sum(
-                xx * attention_mask.unsqueeze(-1), dim=1, keepdim=False
-            )
-            xx = xx / torch.sum(attention_mask, dim=-1, keepdim=True)
+            xx = self.convnet(xx)
+            xx = self.linear_conv_final(xx)
             x_bert.append(xx)
+        if self.cfg.hidden_stack_enable:
+            if "albert" in self.cfg.nlp_model_name:
+                x_bert.append(x[0].mean(dim=1))
+            else:
+                if "funnel" in self.cfg.nlp_model_name:
+                    xx = torch.stack([self.dropout_bert_stack(xx) for xx in x[1][-3:]]).mean(dim=0)
+                else:
+                    xx = torch.stack([self.dropout_bert_stack(xx) for xx in x[1][-4:]]).mean(dim=0)
+                xx = torch.sum(
+                    xx * attention_mask.unsqueeze(-1), dim=1, keepdim=False
+                )
+                xx = xx / torch.sum(attention_mask, dim=-1, keepdim=True)
+                xx = self.linear_hidden_final(xx)
+                x_bert.append(xx)
 
         # residual feature
         if self.cfg.rnn_module_num > 0:
             x_lstm = self.lstm(torch.cat([x[1][idx] for idx in self.cfg.rnn_hidden_indice], dim=2)).mean(dim=1)
+            x_lstm = self.linear_lstm_final(x_lstm)
             x_bert.append(x_lstm)
         if self.cfg.tcn_module_enable:
             x_tcn = self.tcn(self.dropout(x[0]).permute(0, 2, 1)).mean(dim=2)
+            x_tcn = self.linear_tcn_final(x_tcn)
             x_bert.append(x_tcn)
 
-        x_bert = torch.cat(x_bert, dim=1)
-
+        x_bert = torch.stack(x_bert, dim=2)
+        x_bert = self.conv1d(x_bert).mean(dim=2)
         if self.cfg.prep_enable:
             perplexity = self.linear_perp(perplexity)
             x_out = torch.stack([f(x_bert, perplexity) for _ in range(self.cfg.multi_dropout_num)]).mean(dim=0)
@@ -497,6 +587,8 @@ class CommonLitModule(LightningModule):
             params.append({"params": self.bert.lm_head.parameters(), "weight_decay": self.cfg.weight_decay, "lr": self.cfg.lr_bert})
         elif "albert" in self.cfg.nlp_model_name:
             params.append({"params": self.bert.predictions.parameters(), "weight_decay": self.cfg.weight_decay, "lr": self.cfg.lr_bert})
+        elif "deberta" in self.cfg.nlp_model_name:
+            params.append({"params": self.bert.cls.parameters(), "weight_decay": self.cfg.weight_decay, "lr": self.cfg.lr_bert})
         elif "roberta" in self.cfg.nlp_model_name and "bigbird" not in self.cfg.nlp_model_name:
             params.append({"params": self.bert.lm_head.parameters(), "weight_decay": self.cfg.weight_decay, "lr": self.cfg.lr_bert})
         elif "bert" in self.cfg.nlp_model_name or "bigbird" in self.cfg.nlp_model_name:
@@ -512,6 +604,18 @@ class CommonLitModule(LightningModule):
         params.append(extract_params(self.linear_perp.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
         params.append(extract_params(self.linear_vocab.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
         params.append(extract_params(self.linear_vocab.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
+        params.append(extract_params(self.linear_tcn_final.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
+        params.append(extract_params(self.linear_tcn_final.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
+        params.append(extract_params(self.linear_lstm_final.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
+        params.append(extract_params(self.linear_lstm_final.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
+        params.append(extract_params(self.linear_hidden_final.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
+        params.append(extract_params(self.linear_hidden_final.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
+        params.append(extract_params(self.linear_conv_final.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
+        params.append(extract_params(self.linear_conv_final.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
+        params.append(extract_params(self.linear_vocab_final.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
+        params.append(extract_params(self.linear_vocab_final.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
+        params.append(extract_params(self.conv1d.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
+
         params.append(extract_params(self.lstm.named_parameters(), lr=self.cfg.lr_rnn, weight_decay=self.cfg.weight_decay, no_decay=False))
         params.append(extract_params(self.lstm.named_parameters(), lr=self.cfg.lr_rnn, weight_decay=0, no_decay=True))
         params.append(extract_params(self.tcn.named_parameters(), lr=self.cfg.lr_tcn, weight_decay=self.cfg.weight_decay, no_decay=False))
@@ -593,63 +697,18 @@ def config_large(cfg: Config, nlp_model_name: str):
 
 
 if __name__ == "__main__":
-    experiment_name = "bert-base tuninga"
-    folds = [0, 1, 2, 3, 4]
+    experiment_name = "conv1d"
+    folds = [0]
 
-    """
-    # other models
-    for lr_bert in [5e-5]:
+    for final_dim in [128, 256, 512, 1024]:
         cfg = Config(experiment_name=experiment_name)
+        cfg = config_large(cfg, nlp_model_name="roberta-large")
         cfg.rnn_module_num = 1
-        cfg.lr_bert = lr_bert
-        cfg.prep_enable = True
+        cfg.self_attention_enable = True
+        cfg.tcn_module_enable = True
+        cfg.linear_vocab_enable = True
         cfg.hidden_stack_enable = True
+        cfg.linear_final_dim = final_dim
+        cfg.linear_dim = final_dim//2
         main(cfg, folds=folds)
-
-    for lr_bert_decay in [0.95, 0.98, 1]:
-        cfg = Config(experiment_name=experiment_name)
-        cfg.rnn_module_num = 1
-        cfg.lr_bert_decay = lr_bert_decay
-        cfg.prep_enable = True
-        cfg.hidden_stack_enable = True
-        main(cfg, folds=folds)
-    # +CNN
-    cfg = Config(experiment_name=experiment_name)
-    cfg.rnn_module_num = 1
-    cfg.tcn_module_enable = True
-    cfg.prep_enable = True
-    cfg.hidden_stack_enable = True
-    main(cfg, folds=folds)
-
-    # -prep
-    cfg = Config(experiment_name=experiment_name)
-    cfg.rnn_module_num = 1
-    cfg.prep_enable = False
-    cfg.hidden_stack_enable = True
-    main(cfg, folds=folds)
-
-    # vocab = True
-    cfg = Config(experiment_name=experiment_name)
-    cfg.rnn_module_num = 1
-    cfg.linear_vocab_enable = True
-    cfg.hidden_stack_enable = True
-    main(cfg, folds=folds)
-
-    # attention = True
-    cfg = Config(experiment_name=experiment_name)
-    cfg.rnn_module_num = 1
-    cfg.self_attention_enable = True
-    cfg.hidden_stack_enable = True
-    main(cfg, folds=folds)
-    """
-
-    # all = True
-    cfg = Config(experiment_name=experiment_name)
-    cfg.rnn_module_num = 1
-    cfg.self_attention_enable = True
-    cfg.tcn_module_enable = True
-    cfg.linear_vocab_enable = True
-    cfg.hidden_stack_enable = True
-    main(cfg, folds=folds)
-
 

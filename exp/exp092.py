@@ -159,7 +159,7 @@ class Config:
     debug: bool = False
     fold: int = 0
 
-    nlp_model_name: str = "bert-base-cased"
+    nlp_model_name: str = "roberta-base"
     linear_dim: int = 128
     linear_vocab_dim_1: int = 64
     linear_vocab_dim: int = 16
@@ -179,6 +179,7 @@ class Config:
     training_steps_ratio: float = 1
     if debug:
         epochs: int = 2
+        epochs_max: int = 8
     else:
         epochs: int = 6
         epochs_max: int = 8
@@ -290,7 +291,7 @@ class CommonLitModule(LightningModule):
                 self.cfg.activation()
             )
             self.linear2 = nn.Sequential(
-                nn.Linear(self.cfg.linear_dim + self.cfg.linear_perplexity_dim, 1)
+                nn.Linear(self.cfg.linear_dim, 1)
             )
         else:
             self.linear1 = nn.Sequential(
@@ -330,13 +331,37 @@ class CommonLitModule(LightningModule):
             x_out = F.dropout(x_in, p=self.cfg.multi_dropout_ratio, training=True)
             if perplexity is not None:
                 x_out = self.linear1(torch.cat([x_out, perplexity], dim=1))
-                x_out = self.linear2(torch.cat([x_out, perplexity], dim=1))
+                x_out = self.linear2(x_out)
             else:
                 x_out = self.linear1(x_out)
                 x_out = self.linear2(x_out)
             return x_out
 
-        if "roberta" in self.cfg.nlp_model_name:
+        if "funnel" in self.cfg.nlp_model_name:
+            x = self.bert.funnel(input_ids=input_ids_masked,
+                                 attention_mask=attention_mask,
+                                 token_type_ids=token_type_ids,
+                                 output_attentions=True,
+                                 output_hidden_states=True)
+            if self.cfg.prep_enable:
+                input_ids_pred = self.bert.lm_head(x[0])
+        elif "albert" in self.cfg.nlp_model_name:
+            x = self.bert.albert(input_ids=input_ids_masked,
+                                 attention_mask=attention_mask,
+                                 token_type_ids=token_type_ids,
+                                 output_attentions=True,
+                                 output_hidden_states=True)
+            if self.cfg.prep_enable:
+                input_ids_pred = self.bert.predictions(x[0])
+        elif "deberta" in self.cfg.nlp_model_name:
+            x = self.bert.deberta(input_ids=input_ids_masked,
+                                  attention_mask=attention_mask,
+                                  token_type_ids=token_type_ids,
+                                  output_attentions=True,
+                                  output_hidden_states=True)
+            if self.cfg.prep_enable:
+                input_ids_pred = self.bert.cls(x[0])
+        elif "roberta" in self.cfg.nlp_model_name and "bigbird" not in self.cfg.nlp_model_name:
             x = self.bert.roberta(input_ids=input_ids_masked,
                                   attention_mask=attention_mask,
                                   token_type_ids=token_type_ids,
@@ -344,7 +369,8 @@ class CommonLitModule(LightningModule):
                                   output_hidden_states=True)
             if self.cfg.prep_enable:
                 input_ids_pred = self.bert.lm_head(x[0])
-        elif "bert" in self.cfg.nlp_model_name:
+
+        elif "bert" in self.cfg.nlp_model_name or "bigbird" in self.cfg.nlp_model_name:
             x = self.bert.bert(input_ids=input_ids_masked,
                                attention_mask=attention_mask,
                                token_type_ids=token_type_ids,
@@ -368,12 +394,18 @@ class CommonLitModule(LightningModule):
             xx = torch.cat([self.dropout_attn(xx) for xx in x[2]], dim=1)
             x_bert.append(self.convnet(xx))
         if self.cfg.hidden_stack_enable:
-            xx = torch.stack([self.dropout_bert_stack(xx) for xx in x[1][-4:]]).mean(dim=0)
-            xx = torch.sum(
-                xx * attention_mask.unsqueeze(-1), dim=1, keepdim=False
-            )
-            xx = xx / torch.sum(attention_mask, dim=-1, keepdim=True)
-            x_bert.append(xx)
+            if "albert" in self.cfg.nlp_model_name:
+                x_bert.append(x[0].mean(dim=1))
+            else:
+                if "funnel" in self.cfg.nlp_model_name:
+                    xx = torch.stack([self.dropout_bert_stack(xx) for xx in x[1][-3:]]).mean(dim=0)
+                else:
+                    xx = torch.stack([self.dropout_bert_stack(xx) for xx in x[1][-4:]]).mean(dim=0)
+                xx = torch.sum(
+                    xx * attention_mask.unsqueeze(-1), dim=1, keepdim=False
+                )
+                xx = xx / torch.sum(attention_mask, dim=-1, keepdim=True)
+                x_bert.append(xx)
 
         # residual feature
         if self.cfg.rnn_module_num > 0:
@@ -497,6 +529,8 @@ class CommonLitModule(LightningModule):
             params.append({"params": self.bert.lm_head.parameters(), "weight_decay": self.cfg.weight_decay, "lr": self.cfg.lr_bert})
         elif "albert" in self.cfg.nlp_model_name:
             params.append({"params": self.bert.predictions.parameters(), "weight_decay": self.cfg.weight_decay, "lr": self.cfg.lr_bert})
+        elif "deberta" in self.cfg.nlp_model_name:
+            params.append({"params": self.bert.cls.parameters(), "weight_decay": self.cfg.weight_decay, "lr": self.cfg.lr_bert})
         elif "roberta" in self.cfg.nlp_model_name and "bigbird" not in self.cfg.nlp_model_name:
             params.append({"params": self.bert.lm_head.parameters(), "weight_decay": self.cfg.weight_decay, "lr": self.cfg.lr_bert})
         elif "bert" in self.cfg.nlp_model_name or "bigbird" in self.cfg.nlp_model_name:
@@ -593,63 +627,18 @@ def config_large(cfg: Config, nlp_model_name: str):
 
 
 if __name__ == "__main__":
-    experiment_name = "bert-base tuninga"
+    experiment_name = "perp only 1dim"
     folds = [0, 1, 2, 3, 4]
 
-    """
-    # other models
-    for lr_bert in [5e-5]:
+    for linear_perplexity_dim in [128]:
         cfg = Config(experiment_name=experiment_name)
+        config_large(cfg, nlp_model_name="roberta-large")
         cfg.rnn_module_num = 1
-        cfg.lr_bert = lr_bert
-        cfg.prep_enable = True
+        cfg.linear_perplexity_dim = linear_perplexity_dim
+        cfg.self_attention_enable = True
+        cfg.tcn_module_enable = True
+        cfg.linear_vocab_enable = True
         cfg.hidden_stack_enable = True
+
+        cfg.linear_dim = 2048
         main(cfg, folds=folds)
-
-    for lr_bert_decay in [0.95, 0.98, 1]:
-        cfg = Config(experiment_name=experiment_name)
-        cfg.rnn_module_num = 1
-        cfg.lr_bert_decay = lr_bert_decay
-        cfg.prep_enable = True
-        cfg.hidden_stack_enable = True
-        main(cfg, folds=folds)
-    # +CNN
-    cfg = Config(experiment_name=experiment_name)
-    cfg.rnn_module_num = 1
-    cfg.tcn_module_enable = True
-    cfg.prep_enable = True
-    cfg.hidden_stack_enable = True
-    main(cfg, folds=folds)
-
-    # -prep
-    cfg = Config(experiment_name=experiment_name)
-    cfg.rnn_module_num = 1
-    cfg.prep_enable = False
-    cfg.hidden_stack_enable = True
-    main(cfg, folds=folds)
-
-    # vocab = True
-    cfg = Config(experiment_name=experiment_name)
-    cfg.rnn_module_num = 1
-    cfg.linear_vocab_enable = True
-    cfg.hidden_stack_enable = True
-    main(cfg, folds=folds)
-
-    # attention = True
-    cfg = Config(experiment_name=experiment_name)
-    cfg.rnn_module_num = 1
-    cfg.self_attention_enable = True
-    cfg.hidden_stack_enable = True
-    main(cfg, folds=folds)
-    """
-
-    # all = True
-    cfg = Config(experiment_name=experiment_name)
-    cfg.rnn_module_num = 1
-    cfg.self_attention_enable = True
-    cfg.tcn_module_enable = True
-    cfg.linear_vocab_enable = True
-    cfg.hidden_stack_enable = True
-    main(cfg, folds=folds)
-
-

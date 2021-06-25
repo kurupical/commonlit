@@ -52,7 +52,8 @@ if exp_name != "":
                          hover_name="hover_text",
                          range_x=(-4, 2),
                          range_y=(-4, 2),
-                         height=500)
+                         height=750,
+                         width=750)
         st.plotly_chart(fig)
 
         fig = px.histogram(data_frame=df,

@@ -517,6 +517,16 @@ class CommonLitModule(LightningModule):
 
 
         params = []
+        if "funnel" in self.cfg.nlp_model_name:
+            params.append({"params": self.bert.lm_head.parameters(), "weight_decay": self.cfg.weight_decay, "lr": self.cfg.lr_bert})
+        elif "albert" in self.cfg.nlp_model_name:
+            params.append({"params": self.bert.predictions.parameters(), "weight_decay": self.cfg.weight_decay, "lr": self.cfg.lr_bert})
+        elif "roberta" in self.cfg.nlp_model_name and "bigbird" not in self.cfg.nlp_model_name:
+            params.append({"params": self.bert.lm_head.parameters(), "weight_decay": self.cfg.weight_decay, "lr": self.cfg.lr_bert})
+        elif "bert" in self.cfg.nlp_model_name or "bigbird" in self.cfg.nlp_model_name:
+            params.append({"params": self.bert.cls.parameters(), "weight_decay": self.cfg.weight_decay, "lr": self.cfg.lr_bert})
+        else:
+            raise ValueError("mask用のparameterありません")
         params.extend(bert_params())
         params.append(extract_params(self.linear1.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
         params.append(extract_params(self.linear1.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
@@ -608,8 +618,9 @@ def config_large(cfg: Config, nlp_model_name: str):
 
 if __name__ == "__main__":
     experiment_name = "roberta-large tune"
-    folds = [0]
+    folds = [0, 1, 2, 3, 4]
 
+    """
     # baseline
     cfg = Config(experiment_name=experiment_name)
     cfg = config_large(cfg, "roberta-large")
@@ -634,6 +645,7 @@ if __name__ == "__main__":
     cfg.linear_vocab_enable = True
     cfg.hidden_stack_enable = True
     main(cfg, folds=folds)
+    """
 
     # attention = True
     cfg = Config(experiment_name=experiment_name)
