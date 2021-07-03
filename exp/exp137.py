@@ -25,7 +25,6 @@ from collections import OrderedDict
 from torch.nn.utils import weight_norm
 import copy
 import timm
-import torchcontrib
 
 class CommonLitDataset(Dataset):
     def __init__(self, df, tokenizer, cfg, transforms=None):
@@ -245,8 +244,12 @@ class Config:
     conv2d_hidden_channel: int = 32
 
     simple_structure: bool = True
+    crossentropy: bool = False
     crossentropy_min: int = -8
     crossentropy_max: int = 4
+
+    accumulate_grad_batches: int = 1
+    gradient_clipping: int = 0
 
 class Lambda(nn.Module):
     def __init__(self, func):
@@ -445,6 +448,9 @@ class CommonLitModule(LightningModule):
         self.dataset_val: Dataset
 
         self.best_rmse = np.inf
+        self.step = 0
+        self.prev_loss = 1.5
+        self.previous_rmse = np.inf
         self.reinit_bert()
 
     def reinit_bert(self):
@@ -691,6 +697,8 @@ class CommonLitModule(LightningModule):
         scheduler = self.lr_schedulers()
         scheduler.step()
 
+        self.step += 1
+
         input_ids_masked, attention_mask, token_type_ids, input_ids, target, std = batch
         output_mean, output_std = self.forward(input_ids_masked, attention_mask, token_type_ids, input_ids)
 
@@ -699,13 +707,31 @@ class CommonLitModule(LightningModule):
             dist_target = torch.distributions.Normal(target, std)
             loss = torch.distributions.kl_divergence(dist_pred, dist_target).mean()
         else:
-            target = (target - self.cfg.crossentropy_min) / (self.cfg.crossentropy_max - self.cfg.crossentropy_min)
-            loss = F.binary_cross_entropy_with_logits(output_mean.flatten(), target.flatten())
+            if self.cfg.crossentropy:
+                target = (target - self.cfg.crossentropy_min) / (self.cfg.crossentropy_max - self.cfg.crossentropy_min)
+                loss = F.binary_cross_entropy_with_logits(output_mean.flatten(), target.flatten())
+            else:
+                loss = F.mse_loss(output_mean.flatten(), target.flatten())
 
         self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         return loss
 
+    def get_val_step(self):
+        if self.previous_rmse > 0.5:
+            return 16
+        if self.previous_rmse > 0.49:
+            return 8
+        if self.previous_rmse > 0.48:
+            return 4
+        if self.previous_rmse > 0.47:
+            return 2
+        return 1
+
+
     def validation_step(self, batch, batch_idx):
+        if self.get_val_step() > self.step:
+            self.log('val_loss', self.prev_loss, prog_bar=True)
+            return None, None
         input_ids_masked, attention_mask, token_type_ids, input_ids, target, std = batch
         output_mean, output_std = self.forward(input_ids_masked, attention_mask, token_type_ids, input_ids)
 
@@ -714,22 +740,35 @@ class CommonLitModule(LightningModule):
             dist_target = torch.distributions.Normal(target, std)
             loss = torch.distributions.kl_divergence(dist_pred, dist_target).mean()
         else:
-            target = (target - self.cfg.crossentropy_min) / (self.cfg.crossentropy_max - self.cfg.crossentropy_min)
-            loss = F.binary_cross_entropy_with_logits(output_mean.flatten(), target.flatten())
+            if self.cfg.crossentropy:
+                target = (target - self.cfg.crossentropy_min) / (self.cfg.crossentropy_max - self.cfg.crossentropy_min)
+                loss = F.binary_cross_entropy_with_logits(output_mean.flatten(), target.flatten())
+            else:
+                loss = F.mse_loss(output_mean.flatten(), target.flatten())
         self.log('val_loss', loss, prog_bar=True)
+        self.prev_loss = loss
         return output_mean.cpu().detach().numpy().flatten(), target.cpu().detach().numpy().flatten()
 
     def validation_epoch_end(self, val_step_outputs):
         def sigmoid(x):
             return 1 / (1 + np.exp(-x))
+
+        if self.get_val_step() > self.step:
+            return
+        self.step = 0
+
         pred = []
         target = []
         for output in val_step_outputs:
             pred.extend(output[0].tolist())
             target.extend(output[1].tolist())
 
-        pred = (self.cfg.crossentropy_max - self.cfg.crossentropy_min) * sigmoid(np.array(pred)) + self.cfg.crossentropy_min
-        target = (self.cfg.crossentropy_max - self.cfg.crossentropy_min) * np.array(target) + self.cfg.crossentropy_min
+        pred = np.array(pred)
+        target = np.array(target)
+
+        if self.cfg.crossentropy:
+            pred = (self.cfg.crossentropy_max - self.cfg.crossentropy_min) * sigmoid(np.array(pred)) + self.cfg.crossentropy_min
+            target = (self.cfg.crossentropy_max - self.cfg.crossentropy_min) * np.array(target) + self.cfg.crossentropy_min
 
         if len(pred) != len(self.df_val):
             return
@@ -741,6 +780,7 @@ class CommonLitModule(LightningModule):
         df_val.to_csv(f"{self.output_dir}/val_fold{self.cfg.fold}_step{str(self.global_step).zfill(5)}.csv", index=False)
 
         rmse = np.sqrt(1 / len(pred) * ((target - pred)**2).sum())
+        self.previous_rmse = rmse
         self.log(f"rmse_fold{self.cfg.fold}", rmse, prog_bar=True)
 
         if self.best_rmse > rmse:
@@ -907,9 +947,11 @@ def main(cfg_original: Config,
                                   # amp_level="02",
                                   max_epochs=cfg.epochs,
                                   benchmark=True,
-                                  val_check_interval=0.05,
+                                  val_check_interval=0.001,
                                   progress_bar_refresh_rate=1,
                                   default_root_dir=output_dir,
+                                  gradient_clip_val=cfg.gradient_clipping,
+                                  accumulate_grad_batches=cfg.accumulate_grad_batches,
                                   callbacks=[checkpoint_callback])
 
                 trainer.fit(model)
@@ -920,7 +962,6 @@ def main(cfg_original: Config,
                 torch.cuda.empty_cache()
             except Exception as e:
                 print(e)
-                raise
         mlflow.log_metric("rmse_mean", rmse / len(folds))
 
 
@@ -934,23 +975,38 @@ def config_large(cfg: Config, nlp_model_name: str):
 
 
 if __name__ == "__main__":
-    experiment_name = "simple nn"
+    experiment_name = "bert/roberta tuning"
     folds = [0, 1, 2, 3, 4]
 
-    for ratio in [1]:
-        cfg = Config(experiment_name=experiment_name)
-        cfg = config_large(cfg, nlp_model_name="roberta-large")
-        cfg.reinit_layers = 3
-        cfg.pooler_enable = True
-        cfg.kl_div_enable = False
-        cfg.reinit_pooler = True
-        cfg.kl_div_enable = False
-        cfg.simple_structure = True
-        cfg.crossentropy_min = -4 * ratio
-        cfg.crossentropy_max = 2 * ratio
-        # cfg.rnn_module_num = 1
-        # cfg.tcn_module_enable = True
-        # cfg.linear_vocab_enable = True
-        # cfg.hidden_stack_enable = True
-        # main(cfg, folds=folds)
-        main(cfg, folds=folds)
+    for nlp_model_name in ["roberta-base"]:
+        for fine_tuned_path in ["finetuned_model/roberta_base_warmup_10",
+                                None]:
+            for lr_fc in [5e-5, 1e-4, 2.5e-4]:
+                cfg = Config(experiment_name=experiment_name)
+                cfg.lr_fc = lr_fc
+                cfg.hidden_stack_enable = True
+                cfg.reinit_layers = 2
+                cfg.gradient_clipping = 0.2
+                cfg.reinit_pooler = False
+                cfg.pooler_enable = True
+                cfg.kl_div_enable = False
+                cfg.simple_structure = True
+                cfg.fine_tuned_path = fine_tuned_path
+                main(cfg, folds=folds)
+
+    for nlp_model_name in ["roberta-large", "microsoft/deberta-large"]:
+        for lr_fc in [5e-5, 1e-4, 2.5e-4]:
+            for fine_tuned_path in ["finetuned_model/roberta_large_5",
+                                    None]:
+                cfg = Config(experiment_name=experiment_name)
+                cfg = config_large(cfg, nlp_model_name=nlp_model_name)
+                cfg.lr_fc = lr_fc
+                cfg.hidden_stack_enable = True
+                cfg.reinit_layers = 4
+                cfg.gradient_clipping = 0.5
+                cfg.reinit_pooler = False
+                cfg.pooler_enable = True
+                cfg.kl_div_enable = False
+                cfg.simple_structure = True
+                main(cfg, folds=folds)
+

@@ -25,7 +25,6 @@ from collections import OrderedDict
 from torch.nn.utils import weight_norm
 import copy
 import timm
-import torchcontrib
 
 class CommonLitDataset(Dataset):
     def __init__(self, df, tokenizer, cfg, transforms=None):
@@ -245,8 +244,6 @@ class Config:
     conv2d_hidden_channel: int = 32
 
     simple_structure: bool = True
-    crossentropy_min: int = -8
-    crossentropy_max: int = 4
 
 class Lambda(nn.Module):
     def __init__(self, func):
@@ -279,163 +276,164 @@ class CommonLitModule(LightningModule):
             self.tokenizer.pad_token = self.tokenizer.eos_token
         self.dropout_bert_stack = nn.Dropout(self.cfg.dropout_stack)
         pl.seed_everything(self.cfg.seed)
+        self.lstm = self.make_lstm_module()
+        if self.cfg.word_axis:
+            self.tcn = self.cfg.tcn_module(num_inputs=self.cfg.max_length,
+                                           num_channels=[self.cfg.max_length]*cfg.tcn_module_num,
+                                           kernel_size=self.cfg.tcn_module_kernel_size,
+                                           dropout=self.cfg.tcn_module_dropout)
+        else:
+            self.tcn = self.cfg.tcn_module(num_inputs=self.bert.config.hidden_size,
+                                           num_channels=[self.bert.config.hidden_size]*cfg.tcn_module_num,
+                                           kernel_size=self.cfg.tcn_module_kernel_size,
+                                           dropout=self.cfg.tcn_module_dropout)
+
+        if self.cfg.cnn_model_name == "SimpleConv2D":
+            self.convnet = nn.Sequential(
+                nn.Conv2d(self.bert.config.num_hidden_layers * self.bert.config.num_attention_heads,
+                          self.cfg.conv2d_hidden_channel, kernel_size=(1, 1), stride=(1, 1), bias=False),
+                nn.ReLU(),
+                nn.Conv2d(self.cfg.conv2d_hidden_channel,
+                          1, kernel_size=(1, 1), stride=(1, 1), bias=False),
+                nn.ReLU(),
+                Lambda(lambda x: x.view(x.size(0), -1)),
+            )
+            self.convnet.num_features = self.cfg.max_length**2
+        else:
+            self.convnet = timm.create_model(self.cfg.cnn_model_name,
+                                             pretrained=self.cfg.cnn_pretrained,
+                                             num_classes=0)
+            if "efficientnet" in self.cfg.cnn_model_name:
+                self.convnet.conv_stem = nn.Conv2d(self.bert.config.num_hidden_layers*self.bert.config.num_attention_heads,
+                                                   32, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
+            if "resnet" in self.cfg.cnn_model_name:
+                self.convnet.conv1 = nn.Conv2d(self.bert.config.num_hidden_layers*self.bert.config.num_attention_heads,
+                                               64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False)
 
         # network cfg
         hidden_size = 0
         if self.cfg.linear_vocab_enable:
             hidden_size += self.cfg.linear_final_dim
-            self.linear_vocab = nn.Sequential(
-                nn.Linear(self.bert.config.hidden_size, self.cfg.linear_vocab_dim_1),
-                nn.Dropout(self.cfg.dropout),
-                self.cfg.activation(),
-                nn.Linear(self.cfg.linear_vocab_dim_1, self.cfg.linear_vocab_dim),
-                nn.Dropout(self.cfg.dropout),
-                self.cfg.activation()
-            )
-            self.linear_vocab_final = nn.Sequential(
-                nn.Linear(self.cfg.linear_vocab_dim*self.cfg.max_length, self.cfg.linear_final_dim),
-                # nn.BatchNorm1d(self.cfg.linear_final_dim),
-                self.cfg.activation(),
-                nn.Dropout(self.cfg.dropout)
-            )
         if self.cfg.self_attention_enable:
             hidden_size += self.cfg.linear_final_dim
-            if self.cfg.cnn_model_name == "SimpleConv2D":
-                self.convnet = nn.Sequential(
-                    nn.Conv2d(self.bert.config.num_hidden_layers * self.bert.config.num_attention_heads,
-                              self.cfg.conv2d_hidden_channel, kernel_size=(1, 1), stride=(1, 1), bias=False),
-                    nn.ReLU(),
-                    nn.Conv2d(self.cfg.conv2d_hidden_channel,
-                              1, kernel_size=(1, 1), stride=(1, 1), bias=False),
-                    nn.ReLU(),
-                    Lambda(lambda x: x.view(x.size(0), -1)),
-                )
-                self.convnet.num_features = self.cfg.max_length ** 2
-            else:
-                self.convnet = timm.create_model(self.cfg.cnn_model_name,
-                                                 pretrained=self.cfg.cnn_pretrained,
-                                                 num_classes=0)
-                if "efficientnet" in self.cfg.cnn_model_name:
-                    self.convnet.conv_stem = nn.Conv2d(
-                        self.bert.config.num_hidden_layers * self.bert.config.num_attention_heads,
-                        32, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
-                if "resnet" in self.cfg.cnn_model_name:
-                    self.convnet.conv1 = nn.Conv2d(
-                        self.bert.config.num_hidden_layers * self.bert.config.num_attention_heads,
-                        64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False)
-
-            self.linear_conv_final = nn.Sequential(
-                nn.Linear(self.convnet.num_features, self.cfg.linear_final_dim),
-                # nn.BatchNorm1d(self.cfg.linear_final_dim),
-                self.cfg.activation(),
-                nn.Dropout(self.cfg.dropout)
-            )
         if self.cfg.hidden_stack_enable:
             hidden_size += self.cfg.linear_final_dim
-            self.linear_hidden_final = nn.Sequential(
-                nn.Linear(self.bert.config.hidden_size, self.cfg.linear_final_dim),
-                # nn.BatchNorm1d(self.cfg.linear_final_dim),
-                self.cfg.activation(),
-                nn.Dropout(self.cfg.dropout)
-            )
         if self.cfg.rnn_module_num > 0:
             hidden_size += self.cfg.linear_final_dim
-            self.lstm = self.make_lstm_module()
-            if self.cfg.bidirectional:
-                if self.cfg.word_axis:
-                    lstm_size = int(self.cfg.max_length * len(self.cfg.rnn_hidden_indice) * (
-                                (2 * self.cfg.rnn_module_shrink_ratio) ** self.cfg.rnn_module_num))
-                else:
-                    lstm_size = int(self.bert.config.hidden_size * len(self.cfg.rnn_hidden_indice) * (
-                                (2 * self.cfg.rnn_module_shrink_ratio) ** self.cfg.rnn_module_num))
-            else:
-                if self.cfg.word_axis:
-                    lstm_size = int(self.cfg.max_length * len(self.cfg.rnn_hidden_indice) * (
-                                self.cfg.rnn_module_shrink_ratio ** self.cfg.rnn_module_num))
-
-                else:
-                    lstm_size = int(self.bert.config.hidden_size * len(self.cfg.rnn_hidden_indice) * (
-                                self.cfg.rnn_module_shrink_ratio ** self.cfg.rnn_module_num))
-
-            self.linear_lstm_final = nn.Sequential(
-                nn.Linear(lstm_size, self.cfg.linear_final_dim),
-                # nn.BatchNorm1d(self.cfg.linear_final_dim),
-                self.cfg.activation(),
-                nn.Dropout(self.cfg.dropout)
-            )
         if self.cfg.tcn_module_enable:
             hidden_size += self.cfg.linear_final_dim
-            if self.cfg.word_axis:
-                self.tcn = self.cfg.tcn_module(num_inputs=self.cfg.max_length,
-                                               num_channels=[self.cfg.max_length] * cfg.tcn_module_num,
-                                               kernel_size=self.cfg.tcn_module_kernel_size,
-                                               dropout=self.cfg.tcn_module_dropout)
-            else:
-                self.tcn = self.cfg.tcn_module(num_inputs=self.bert.config.hidden_size,
-                                               num_channels=[self.bert.config.hidden_size] * cfg.tcn_module_num,
-                                               kernel_size=self.cfg.tcn_module_kernel_size,
-                                               dropout=self.cfg.tcn_module_dropout)
-            self.linear_tcn_final = nn.Sequential(
-                nn.Linear(self.bert.config.hidden_size, self.cfg.linear_final_dim),
-                # nn.BatchNorm1d(self.cfg.linear_final_dim),
-                self.cfg.activation(),
-                nn.Dropout(self.cfg.dropout)
-            )
         if self.cfg.pooler_enable:
             hidden_size += self.bert.config.hidden_size
         if self.cfg.attention_pool_enable:
             hidden_size += self.cfg.linear_final_dim
-            self.linear_attention_pool_final = nn.Sequential(
-                nn.Dropout(self.cfg.dropout),
-                nn.Linear(self.cfg.max_length ** 2, self.cfg.linear_final_dim),
-                # nn.BatchNorm1d(self.cfg.linear_final_dim),
-                self.cfg.activation(),
-                nn.Dropout(self.cfg.dropout)
-            )
-        if not self.cfg.simple_structure:
-            if self.cfg.prep_enable:
-                self.linear_perp = nn.Sequential(
-                    nn.Linear(1, self.cfg.linear_perplexity_dim),
-                    # nn.BatchNorm1d(self.cfg.perplexity_linear_dim),
-                    nn.Dropout(self.cfg.dropout),
-                    self.cfg.activation()
-                )
-                self.linear1 = nn.Sequential(
-                    nn.Linear(hidden_size + self.cfg.linear_perplexity_dim, self.cfg.linear_dim),
-                    nn.Dropout(self.cfg.dropout),
-                    self.cfg.activation()
-                )
-                self.linear2 = nn.Sequential(
-                    nn.Linear(self.cfg.linear_dim + self.cfg.linear_perplexity_dim, 1)
-                )
-                self.linear1_std = nn.Sequential(
-                    nn.Linear(hidden_size + self.cfg.linear_perplexity_dim, self.cfg.linear_dim),
-                    nn.Dropout(self.cfg.dropout),
-                    self.cfg.activation()
-                )
-                self.linear2_std = nn.Sequential(
-                    nn.Linear(self.cfg.linear_dim + self.cfg.linear_perplexity_dim, 1)
-                )
-            else:
-                self.linear1 = nn.Sequential(
-                    nn.Linear(hidden_size, self.cfg.linear_dim),
-                    nn.Dropout(self.cfg.dropout),
-                    self.cfg.activation()
-                )
-                self.linear2 = nn.Sequential(
-                    nn.Linear(self.cfg.linear_dim, 1)
-                )
-                self.linear1_std = nn.Sequential(
-                    nn.Linear(hidden_size, self.cfg.linear_dim),
-                    nn.Dropout(self.cfg.dropout),
-                    self.cfg.activation()
-                )
-                self.linear2_std = nn.Sequential(
-                    nn.Linear(self.cfg.linear_dim, 1)
-                )
-        else:
-            self.linear_simple = nn.Linear(hidden_size, 1)
 
+        self.linear_perp = nn.Sequential(
+            nn.Linear(1, self.cfg.linear_perplexity_dim),
+            # nn.BatchNorm1d(self.cfg.perplexity_linear_dim),
+            nn.Dropout(self.cfg.dropout),
+            self.cfg.activation()
+        )
+        self.linear_vocab = nn.Sequential(
+            nn.Linear(self.bert.config.hidden_size, self.cfg.linear_vocab_dim_1),
+            nn.Dropout(self.cfg.dropout),
+            self.cfg.activation(),
+            nn.Linear(self.cfg.linear_vocab_dim_1, self.cfg.linear_vocab_dim),
+            nn.Dropout(self.cfg.dropout),
+            self.cfg.activation()
+        )
+
+        self.linear_vocab_final = nn.Sequential(
+            nn.Linear(self.cfg.linear_vocab_dim*self.cfg.max_length, self.cfg.linear_final_dim),
+            # nn.BatchNorm1d(self.cfg.linear_final_dim),
+            self.cfg.activation(),
+            nn.Dropout(self.cfg.dropout)
+        )
+        self.linear_conv_final = nn.Sequential(
+            nn.Linear(self.convnet.num_features, self.cfg.linear_final_dim),
+            # nn.BatchNorm1d(self.cfg.linear_final_dim),
+            self.cfg.activation(),
+            nn.Dropout(self.cfg.dropout)
+        )
+        self.linear_hidden_final = nn.Sequential(
+            nn.Linear(self.bert.config.hidden_size, self.cfg.linear_final_dim),
+            # nn.BatchNorm1d(self.cfg.linear_final_dim),
+            self.cfg.activation(),
+            nn.Dropout(self.cfg.dropout)
+        )
+        if self.cfg.bidirectional:
+            if self.cfg.word_axis:
+                lstm_size = int(self.cfg.max_length * len(self.cfg.rnn_hidden_indice) * (
+                            (2 * self.cfg.rnn_module_shrink_ratio) ** self.cfg.rnn_module_num))
+            else:
+                lstm_size = int(self.bert.config.hidden_size * len(self.cfg.rnn_hidden_indice) * (
+                            (2 * self.cfg.rnn_module_shrink_ratio) ** self.cfg.rnn_module_num))
+        else:
+            if self.cfg.word_axis:
+                lstm_size = int(self.cfg.max_length * len(self.cfg.rnn_hidden_indice) * (
+                            self.cfg.rnn_module_shrink_ratio ** self.cfg.rnn_module_num))
+
+            else:
+                lstm_size = int(self.bert.config.hidden_size * len(self.cfg.rnn_hidden_indice) * (
+                            self.cfg.rnn_module_shrink_ratio ** self.cfg.rnn_module_num))
+
+        self.linear_lstm_final = nn.Sequential(
+            nn.Linear(lstm_size, self.cfg.linear_final_dim),
+            # nn.BatchNorm1d(self.cfg.linear_final_dim),
+            self.cfg.activation(),
+            nn.Dropout(self.cfg.dropout)
+        )
+
+        self.linear_tcn_final = nn.Sequential(
+            nn.Linear(self.bert.config.hidden_size, self.cfg.linear_final_dim),
+            # nn.BatchNorm1d(self.cfg.linear_final_dim),
+            self.cfg.activation(),
+            nn.Dropout(self.cfg.dropout)
+        )
+
+        self.linear_attention_pool_final = nn.Sequential(
+            nn.Dropout(self.cfg.dropout),
+            nn.Linear(self.cfg.max_length**2, self.cfg.linear_final_dim),
+            # nn.BatchNorm1d(self.cfg.linear_final_dim),
+            self.cfg.activation(),
+            nn.Dropout(self.cfg.dropout)
+        )
+
+        if self.cfg.prep_enable:
+            self.linear1 = nn.Sequential(
+                nn.Linear(hidden_size + self.cfg.linear_perplexity_dim, self.cfg.linear_dim),
+                nn.Dropout(self.cfg.dropout),
+                self.cfg.activation()
+            )
+            self.linear2 = nn.Sequential(
+                nn.Linear(self.cfg.linear_dim + self.cfg.linear_perplexity_dim, 1)
+            )
+            self.linear1_std = nn.Sequential(
+                nn.Linear(hidden_size + self.cfg.linear_perplexity_dim, self.cfg.linear_dim),
+                nn.Dropout(self.cfg.dropout),
+                self.cfg.activation()
+            )
+            self.linear2_std = nn.Sequential(
+                nn.Linear(self.cfg.linear_dim + self.cfg.linear_perplexity_dim, 1)
+            )
+        else:
+            self.linear1 = nn.Sequential(
+                nn.Linear(hidden_size, self.cfg.linear_dim),
+                nn.Dropout(self.cfg.dropout),
+                self.cfg.activation()
+            )
+            self.linear2 = nn.Sequential(
+                nn.Linear(self.cfg.linear_dim, 1)
+            )
+            self.linear1_std = nn.Sequential(
+                nn.Linear(hidden_size, self.cfg.linear_dim),
+                nn.Dropout(self.cfg.dropout),
+                self.cfg.activation()
+            )
+            self.linear2_std = nn.Sequential(
+                nn.Linear(self.cfg.linear_dim, 1)
+            )
+
+        self.linear_simple = nn.Linear(hidden_size, 1)
         self.dropout = nn.Dropout(self.cfg.dropout_output_hidden)
         self.dropout_attn = nn.Dropout(self.cfg.dropout_attn)
 
@@ -515,7 +513,6 @@ class CommonLitModule(LightningModule):
                             ]:
                                 param.data.normal_(mean=0.0, std=self.bert.transformer.config.initializer_range)
 
-        """
         for layer in [self.linear1, self.linear2, self.linear1_std, self.linear2_std, self.linear_perp, self.linear_vocab,
                       self.linear_tcn_final, self.linear_lstm_final, self.linear_hidden_final,
                       self.linear_conv_final, self.linear_vocab_final]:
@@ -524,7 +521,6 @@ class CommonLitModule(LightningModule):
                     module.weight.data.normal_(mean=0.0, std=self.bert.config.initializer_range)
                     if module.bias is not None:
                         module.bias.data.zero_()
-        """
 
     def make_lstm_module(self):
         ret = []
@@ -569,7 +565,10 @@ class CommonLitModule(LightningModule):
                           token_type_ids=token_type_ids,
                           output_attentions=True,
                           output_hidden_states=True)
-            x = [x[0], x[2], x[3], x[1]]
+            if "deberta" in self.cfg.nlp_model_name:
+                pass
+            else:
+                x = [x[0], x[2], x[3], x[1]]
         elif "funnel" in self.cfg.nlp_model_name:
             x = self.bert.funnel(input_ids=input_ids_masked,
                                  attention_mask=attention_mask,
@@ -592,6 +591,7 @@ class CommonLitModule(LightningModule):
                                   token_type_ids=token_type_ids,
                                   output_attentions=True,
                                   output_hidden_states=True)
+            x = [x[0], x[2]]
             if self.cfg.prep_enable:
                 input_ids_pred = self.bert.cls(x[0])
         elif "roberta" in self.cfg.nlp_model_name and "bigbird" not in self.cfg.nlp_model_name:
@@ -699,8 +699,7 @@ class CommonLitModule(LightningModule):
             dist_target = torch.distributions.Normal(target, std)
             loss = torch.distributions.kl_divergence(dist_pred, dist_target).mean()
         else:
-            target = (target - self.cfg.crossentropy_min) / (self.cfg.crossentropy_max - self.cfg.crossentropy_min)
-            loss = F.binary_cross_entropy_with_logits(output_mean.flatten(), target.flatten())
+            loss = F.mse_loss(output_mean.flatten(), target.flatten())
 
         self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         return loss
@@ -714,22 +713,19 @@ class CommonLitModule(LightningModule):
             dist_target = torch.distributions.Normal(target, std)
             loss = torch.distributions.kl_divergence(dist_pred, dist_target).mean()
         else:
-            target = (target - self.cfg.crossentropy_min) / (self.cfg.crossentropy_max - self.cfg.crossentropy_min)
-            loss = F.binary_cross_entropy_with_logits(output_mean.flatten(), target.flatten())
+            loss = F.mse_loss(output_mean.flatten(), target.flatten())
         self.log('val_loss', loss, prog_bar=True)
         return output_mean.cpu().detach().numpy().flatten(), target.cpu().detach().numpy().flatten()
 
     def validation_epoch_end(self, val_step_outputs):
-        def sigmoid(x):
-            return 1 / (1 + np.exp(-x))
         pred = []
         target = []
         for output in val_step_outputs:
             pred.extend(output[0].tolist())
             target.extend(output[1].tolist())
 
-        pred = (self.cfg.crossentropy_max - self.cfg.crossentropy_min) * sigmoid(np.array(pred)) + self.cfg.crossentropy_min
-        target = (self.cfg.crossentropy_max - self.cfg.crossentropy_min) * np.array(target) + self.cfg.crossentropy_min
+        pred = np.array(pred)
+        target = np.array(target)
 
         if len(pred) != len(self.df_val):
             return
@@ -819,46 +815,40 @@ class CommonLitModule(LightningModule):
             else:
                 raise ValueError("mask用のparameterありません")
         params.extend(bert_params())
-        if self.cfg.prep_enable:
-            params.append(extract_params(self.linear1.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
-            params.append(extract_params(self.linear1.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
-            params.append(extract_params(self.linear2.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
-            params.append(extract_params(self.linear2.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
-            params.append(extract_params(self.linear1_std.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
-            params.append(extract_params(self.linear1_std.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
-            params.append(extract_params(self.linear2_std.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
-            params.append(extract_params(self.linear2_std.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
-            params.append(extract_params(self.linear_perp.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
-            params.append(extract_params(self.linear_perp.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
-        if self.cfg.linear_vocab_enable:
-            params.append(extract_params(self.linear_vocab.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
-            params.append(extract_params(self.linear_vocab.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
-            params.append(extract_params(self.linear_vocab_final.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
-            params.append(extract_params(self.linear_vocab_final.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
-        if self.cfg.self_attention_enable:
-            params.append(extract_params(self.linear_conv_final.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
-            params.append(extract_params(self.linear_conv_final.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
-            params.append(extract_params(self.convnet.named_parameters(), lr=self.cfg.lr_cnn, weight_decay=self.cfg.weight_decay, no_decay=False))
-            params.append(extract_params(self.convnet.named_parameters(), lr=self.cfg.lr_cnn, weight_decay=0, no_decay=True))
-        if self.cfg.attention_pool_enable:
-            params.append(extract_params(self.linear_attention_pool_final.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
-            params.append(extract_params(self.linear_attention_pool_final.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
-        if self.cfg.tcn_module_enable:
-            params.append(extract_params(self.linear_tcn_final.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
-            params.append(extract_params(self.linear_tcn_final.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
-            params.append(extract_params(self.tcn.named_parameters(), lr=self.cfg.lr_tcn, weight_decay=self.cfg.weight_decay, no_decay=False))
-            params.append(extract_params(self.tcn.named_parameters(), lr=self.cfg.lr_tcn, weight_decay=0, no_decay=True))
-        if self.cfg.rnn_module_num > 0:
-            params.append(extract_params(self.linear_lstm_final.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
-            params.append(extract_params(self.linear_lstm_final.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
-            params.append(extract_params(self.lstm.named_parameters(), lr=self.cfg.lr_rnn, weight_decay=self.cfg.weight_decay, no_decay=False))
-            params.append(extract_params(self.lstm.named_parameters(), lr=self.cfg.lr_rnn, weight_decay=0, no_decay=True))
-        if self.cfg.hidden_stack_enable:
-            params.append(extract_params(self.linear_hidden_final.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
-            params.append(extract_params(self.linear_hidden_final.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
-        if self.cfg.simple_structure:
-            params.append(extract_params(self.linear_simple.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
-            params.append(extract_params(self.linear_simple.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
+        params.append(extract_params(self.linear1.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
+        params.append(extract_params(self.linear1.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
+        params.append(extract_params(self.linear2.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
+        params.append(extract_params(self.linear2.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
+        params.append(extract_params(self.linear1_std.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
+        params.append(extract_params(self.linear1_std.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
+        params.append(extract_params(self.linear2_std.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
+        params.append(extract_params(self.linear2_std.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
+        params.append(extract_params(self.linear_perp.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
+        params.append(extract_params(self.linear_perp.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
+        params.append(extract_params(self.linear_vocab.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
+        params.append(extract_params(self.linear_vocab.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
+        params.append(extract_params(self.linear_attention_pool_final.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
+        params.append(extract_params(self.linear_attention_pool_final.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
+        params.append(extract_params(self.linear_tcn_final.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
+        params.append(extract_params(self.linear_tcn_final.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
+        params.append(extract_params(self.linear_lstm_final.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
+        params.append(extract_params(self.linear_lstm_final.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
+        params.append(extract_params(self.linear_hidden_final.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
+        params.append(extract_params(self.linear_hidden_final.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
+        params.append(extract_params(self.linear_conv_final.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
+        params.append(extract_params(self.linear_conv_final.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
+        params.append(extract_params(self.linear_vocab_final.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
+        params.append(extract_params(self.linear_vocab_final.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
+        params.append(extract_params(self.linear_simple.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
+        params.append(extract_params(self.linear_simple.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
+
+        params.append(extract_params(self.lstm.named_parameters(), lr=self.cfg.lr_rnn, weight_decay=self.cfg.weight_decay, no_decay=False))
+        params.append(extract_params(self.lstm.named_parameters(), lr=self.cfg.lr_rnn, weight_decay=0, no_decay=True))
+        params.append(extract_params(self.tcn.named_parameters(), lr=self.cfg.lr_tcn, weight_decay=self.cfg.weight_decay, no_decay=False))
+        params.append(extract_params(self.tcn.named_parameters(), lr=self.cfg.lr_tcn, weight_decay=0, no_decay=True))
+        params.append(extract_params(self.convnet.named_parameters(), lr=self.cfg.lr_cnn, weight_decay=self.cfg.weight_decay, no_decay=False))
+        params.append(extract_params(self.convnet.named_parameters(), lr=self.cfg.lr_cnn, weight_decay=0, no_decay=True))
+
         optimizer = self.cfg.optimizer(params)
         num_warmup_steps = int(self.cfg.epochs_max * len(self.df_train) / self.cfg.batch_size * self.cfg.warmup_ratio)
         num_training_steps = int(self.cfg.epochs_max * len(self.df_train) / self.cfg.batch_size) * self.cfg.training_steps_ratio
@@ -920,7 +910,6 @@ def main(cfg_original: Config,
                 torch.cuda.empty_cache()
             except Exception as e:
                 print(e)
-                raise
         mlflow.log_metric("rmse_mean", rmse / len(folds))
 
 
@@ -937,20 +926,83 @@ if __name__ == "__main__":
     experiment_name = "simple nn"
     folds = [0, 1, 2, 3, 4]
 
-    for ratio in [1]:
+    for reinit_layers in [1, 2, 3, 4, 5, 6]:
         cfg = Config(experiment_name=experiment_name)
-        cfg = config_large(cfg, nlp_model_name="roberta-large")
-        cfg.reinit_layers = 3
-        cfg.pooler_enable = True
-        cfg.kl_div_enable = False
-        cfg.reinit_pooler = True
+        cfg = config_large(cfg, nlp_model_name="microsoft/deberta-large")
+        cfg.hidden_stack_enable = True
+        cfg.reinit_layers = reinit_layers
+        if reinit_layers == 0:
+            cfg.reinit_pooler = False
         cfg.kl_div_enable = False
         cfg.simple_structure = True
-        cfg.crossentropy_min = -4 * ratio
-        cfg.crossentropy_max = 2 * ratio
         # cfg.rnn_module_num = 1
         # cfg.tcn_module_enable = True
         # cfg.linear_vocab_enable = True
         # cfg.hidden_stack_enable = True
-        # main(cfg, folds=folds)
         main(cfg, folds=folds)
+
+    cfg = Config(experiment_name=experiment_name)
+    cfg = config_large(cfg, nlp_model_name="microsoft/deberta-large")
+    cfg.hidden_stack_enable = True
+    cfg.kl_div_enable = False
+    if reinit_layers == 0:
+        cfg.reinit_pooler = False
+    cfg.simple_structure = True
+    cfg.rnn_module_num = 1
+    # cfg.tcn_module_enable = True
+    # cfg.linear_vocab_enable = True
+    # cfg.hidden_stack_enable = True
+    main(cfg, folds=folds)
+
+    cfg = Config(experiment_name=experiment_name)
+    cfg = config_large(cfg, nlp_model_name="microsoft/deberta-large")
+    cfg.reinit_layers = 3
+    cfg.reinit_pooler = True
+    cfg.hidden_stack_enable = True
+    cfg.kl_div_enable = False
+    cfg.simple_structure = True
+    # cfg.rnn_module_num = 1
+    cfg.tcn_module_enable = True
+    # cfg.linear_vocab_enable = True
+    # cfg.hidden_stack_enable = True
+    main(cfg, folds=folds)
+
+    cfg = Config(experiment_name=experiment_name)
+    cfg = config_large(cfg, nlp_model_name="microsoft/deberta-large")
+    cfg.reinit_layers = 3
+    cfg.reinit_pooler = True
+    cfg.kl_div_enable = False
+    cfg.hidden_stack_enable = True
+    cfg.simple_structure = True
+    # cfg.rnn_module_num = 1
+    # cfg.tcn_module_enable = True
+    cfg.linear_vocab_enable = True
+    # cfg.hidden_stack_enable = True
+    main(cfg, folds=folds)
+
+    cfg = Config(experiment_name=experiment_name)
+    cfg = config_large(cfg, nlp_model_name="microsoft/deberta-large")
+    cfg.reinit_layers = 3
+    cfg.reinit_pooler = True
+    cfg.kl_div_enable = False
+    cfg.hidden_stack_enable = True
+    cfg.simple_structure = True
+    # cfg.rnn_module_num = 1
+    # cfg.tcn_module_enable = True
+    # cfg.linear_vocab_enable = True
+    cfg.hidden_stack_enable = True
+    main(cfg, folds=folds)
+
+
+    cfg = Config(experiment_name=experiment_name)
+    cfg = config_large(cfg, nlp_model_name="microsoft/deberta-large")
+    cfg.reinit_layers = 3
+    cfg.reinit_pooler = True
+    cfg.kl_div_enable = False
+    cfg.hidden_stack_enable = True
+    cfg.simple_structure = True
+    cfg.rnn_module_num = 1
+    cfg.tcn_module_enable = True
+    cfg.linear_vocab_enable = True
+    cfg.hidden_stack_enable = True
+    main(cfg, folds=folds)

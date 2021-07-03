@@ -25,7 +25,6 @@ from collections import OrderedDict
 from torch.nn.utils import weight_norm
 import copy
 import timm
-import torchcontrib
 
 class CommonLitDataset(Dataset):
     def __init__(self, df, tokenizer, cfg, transforms=None):
@@ -245,8 +244,12 @@ class Config:
     conv2d_hidden_channel: int = 32
 
     simple_structure: bool = True
+    crossentropy: bool = False
     crossentropy_min: int = -8
     crossentropy_max: int = 4
+
+    accumulate_grad_batches: int = 1
+    gradient_clipping: int = 0
 
 class Lambda(nn.Module):
     def __init__(self, func):
@@ -569,7 +572,10 @@ class CommonLitModule(LightningModule):
                           token_type_ids=token_type_ids,
                           output_attentions=True,
                           output_hidden_states=True)
-            x = [x[0], x[2], x[3], x[1]]
+            if "deberta" in self.cfg.nlp_model_name:
+                pass
+            else:
+                x = [x[0], x[2], x[3], x[1]]
         elif "funnel" in self.cfg.nlp_model_name:
             x = self.bert.funnel(input_ids=input_ids_masked,
                                  attention_mask=attention_mask,
@@ -699,8 +705,11 @@ class CommonLitModule(LightningModule):
             dist_target = torch.distributions.Normal(target, std)
             loss = torch.distributions.kl_divergence(dist_pred, dist_target).mean()
         else:
-            target = (target - self.cfg.crossentropy_min) / (self.cfg.crossentropy_max - self.cfg.crossentropy_min)
-            loss = F.binary_cross_entropy_with_logits(output_mean.flatten(), target.flatten())
+            if self.cfg.crossentropy:
+                target = (target - self.cfg.crossentropy_min) / (self.cfg.crossentropy_max - self.cfg.crossentropy_min)
+                loss = F.binary_cross_entropy_with_logits(output_mean.flatten(), target.flatten())
+            else:
+                loss = F.mse_loss(output_mean.flatten(), target.flatten())
 
         self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         return loss
@@ -714,8 +723,11 @@ class CommonLitModule(LightningModule):
             dist_target = torch.distributions.Normal(target, std)
             loss = torch.distributions.kl_divergence(dist_pred, dist_target).mean()
         else:
-            target = (target - self.cfg.crossentropy_min) / (self.cfg.crossentropy_max - self.cfg.crossentropy_min)
-            loss = F.binary_cross_entropy_with_logits(output_mean.flatten(), target.flatten())
+            if self.cfg.crossentropy:
+                target = (target - self.cfg.crossentropy_min) / (self.cfg.crossentropy_max - self.cfg.crossentropy_min)
+                loss = F.binary_cross_entropy_with_logits(output_mean.flatten(), target.flatten())
+            else:
+                loss = F.mse_loss(output_mean.flatten(), target.flatten())
         self.log('val_loss', loss, prog_bar=True)
         return output_mean.cpu().detach().numpy().flatten(), target.cpu().detach().numpy().flatten()
 
@@ -728,8 +740,12 @@ class CommonLitModule(LightningModule):
             pred.extend(output[0].tolist())
             target.extend(output[1].tolist())
 
-        pred = (self.cfg.crossentropy_max - self.cfg.crossentropy_min) * sigmoid(np.array(pred)) + self.cfg.crossentropy_min
-        target = (self.cfg.crossentropy_max - self.cfg.crossentropy_min) * np.array(target) + self.cfg.crossentropy_min
+        pred = np.array(pred)
+        target = np.array(target)
+
+        if self.cfg.crossentropy:
+            pred = (self.cfg.crossentropy_max - self.cfg.crossentropy_min) * sigmoid(np.array(pred)) + self.cfg.crossentropy_min
+            target = (self.cfg.crossentropy_max - self.cfg.crossentropy_min) * np.array(target) + self.cfg.crossentropy_min
 
         if len(pred) != len(self.df_val):
             return
@@ -910,6 +926,8 @@ def main(cfg_original: Config,
                                   val_check_interval=0.05,
                                   progress_bar_refresh_rate=1,
                                   default_root_dir=output_dir,
+                                  gradient_clip_val=cfg.gradient_clipping,
+                                  accumulate_grad_batches=cfg.accumulate_grad_batches,
                                   callbacks=[checkpoint_callback])
 
                 trainer.fit(model)
@@ -920,7 +938,6 @@ def main(cfg_original: Config,
                 torch.cuda.empty_cache()
             except Exception as e:
                 print(e)
-                raise
         mlflow.log_metric("rmse_mean", rmse / len(folds))
 
 
@@ -934,23 +951,19 @@ def config_large(cfg: Config, nlp_model_name: str):
 
 
 if __name__ == "__main__":
-    experiment_name = "simple nn"
+    experiment_name = "bert/roberta tuning"
     folds = [0, 1, 2, 3, 4]
 
-    for ratio in [1]:
-        cfg = Config(experiment_name=experiment_name)
-        cfg = config_large(cfg, nlp_model_name="roberta-large")
-        cfg.reinit_layers = 3
-        cfg.pooler_enable = True
-        cfg.kl_div_enable = False
-        cfg.reinit_pooler = True
-        cfg.kl_div_enable = False
-        cfg.simple_structure = True
-        cfg.crossentropy_min = -4 * ratio
-        cfg.crossentropy_max = 2 * ratio
-        # cfg.rnn_module_num = 1
-        # cfg.tcn_module_enable = True
-        # cfg.linear_vocab_enable = True
-        # cfg.hidden_stack_enable = True
-        # main(cfg, folds=folds)
-        main(cfg, folds=folds)
+    for reinit_layers in [4]:
+#        for gradient_clipping in [0.1, 0.25, 0.5]:
+        for gradient_clipping in [0.5]:
+            cfg = Config(experiment_name=experiment_name)
+            cfg = config_large(cfg, nlp_model_name="microsoft/deberta-large")
+            cfg.hidden_stack_enable = True
+            cfg.reinit_layers = reinit_layers
+            cfg.gradient_clipping = gradient_clipping
+            if reinit_layers == 0:
+                cfg.reinit_pooler = False
+            cfg.kl_div_enable = False
+            cfg.simple_structure = True
+            main(cfg, folds=folds)

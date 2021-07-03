@@ -396,3 +396,94 @@ final_dimをいくつかチューニングし、fold=0であたり付けする
 
 ## exp113
 conv2D(kernel_size=(1, 1))を試してみる
+
+# 2021/6/26
+## exp119: deberta-large + re-initialize
+1: 0.492
+2: 0.488 (ensembleにはこっちのほうが効く)
+3: 0.49
+4: 0.485
+
+## exp121: gradient clipping (epoch=0 only)
+0(baseilne): 0.494
+1: 0.487
+2: 0.479
+3: 0.494
+
+# 2021/6/27
+## exp129
+finetune luke-large
+* gradient_clipping=0.2
+  * init=2 0.483
+  * init=3 0.489
+  * init=4 0.485
+  * init=5 0.485
+* gradient_clipping=0.5
+  * init=2 0.487
+  * init=3 0.487
+  * init=4 0.483
+  * init=5 0.485
+
+# 2021/6/28
+
+## exp131
+* deberta-base でexp060を再現。gradient_clipping.
+
+## exp132
+* luke-largeのいろんな種類を試す(luke-largeのベストパラメータ)
+
+## exp133
+* deberta-largeでいろいろ
+
+## SUB
+60+82+84+91+110+119+125 (CV: 0.4566 / LB: 0.459)
++ exp047: CV 0.4554 / LB: 0.461
++ exp124(bert-base-cased): CV: 0.4549 / LB: 0.46
+- exp110/119 CV: 0.4569 / LB: 0.459(微減)
+
+# 2021/7/2
+## exp139の結果記録
+### reinit_layers + gradient_clipping
+[0, 0]: 0.489
+[0, 0.2]: 0.488
+[1, 0]: 0.482
+[1, 0.2]: 0.484
+[2, 0]: 0.485
+[2, 0.2]: 0.494
+
+### dropout_bert
+0: 0.478
+0.05: 0.48
+0.15: 0.495
+0.2: 0.518
+0.5: 0.7
+
+ここから dropout_bert = 0, reinit_layers = 1, gradient_clipping = 0.2
+
+batch_size = 16, lr_bert = 3e-5 -> CV: 0.480
+batch_size = 16, lr_bert = 5e-5 -> CV: 0.482
+batch_size = 32, lr_bert = 3e-5 -> CV: 0.479
+batch_size = 32, lr_bert = 5e-5 -> CV: 0.479
+
+batch_size = 8, lr_fc = 1e-5 -> CV: 0.484
+batch_size = 8, lr_fc = 1e-4 -> CV: 0.481
+batch_size = 8, lr_fc = 1e-3 -> CV: 0.481
+batch_size = 16, lr_fc = 1e-5 -> CV: 0.48
+batch_size = 16, lr_fc = 1e-4 -> CV: 0.48
+batch_size = 16, lr_fc = 1e-3 -> CV: 0.48
+batch_size = 32, lr_fc = 1e-5 -> CV: 0.48
+batch_size = 32, lr_fc = 1e-4 -> CV: 0.48
+batch_size = 32, lr_fc = 1e-3 -> CV: 0.479
+
+(batch_size = 32)
+lr_bert_decay = 1, lr_bert = 1e-5 -> CV: 0.494
+lr_bert_decay = 1, lr_bert = 3e-5 -> CV: 0.478
+lr_bert_decay = 1, lr_bert = 5e-5 -> CV: 0.479
+lr_bert_decay = 0.95, lr_bert = 1e-5 -> CV: 0.504
+lr_bert_decay = 0.95, lr_bert = 3e-5 -> CV: 0.482
+lr_bert_decay = 0.95, lr_bert = 5e-5 -> CV: 0.479
+lr_bert_decay = 0.9, lr_bert = 1e-5 -> CV: 0.513
+lr_bert_decay = 0.9, lr_bert = 3e-5 -> CV: 0.49
+lr_bert_decay = 0.9, lr_bert = 5e-5 -> CV: 0.4
+
+
