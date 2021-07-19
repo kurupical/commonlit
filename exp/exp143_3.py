@@ -238,9 +238,9 @@ class Config:
     reinit_layers: int = 4
 
     # pooler
-    pooler_enable: bool = True
+    pooler_enable: bool = False
 
-    word_axis: bool = True
+    word_axis: bool = False
 
     # conv1d
     conv1d_num: int = 1
@@ -987,23 +987,13 @@ def config_large(cfg: Config, nlp_model_name: str):
 
 
 if __name__ == "__main__":
-    experiment_name = "roberta-base crossentropy / KLDivLoss"
+    experiment_name = "roberta-base lstm"
     folds = [0, 1, 2, 3, 4]
 
     # baseline
-    for crossentropy_range in [(-6, 4), (-5, 3)]:
+    for linear_final_dim in [256, 512]:
         cfg = Config(experiment_name=experiment_name)
-        cfg.crossentropy = True
-        cfg.crossentropy_min = crossentropy_range[0]
-        cfg.crossentropy_max = crossentropy_range[1]
+        cfg.rnn_module_num = 1
+        cfg.simple_structure = True
+        cfg.linear_final_dim = linear_final_dim
         main(cfg, folds=folds)
-
-    cfg = Config(experiment_name=experiment_name)
-    cfg.kl_div_enable = True
-    main(cfg, folds=folds)
-
-    for dropout in [0, 0.1, 0.2, 0.5]:
-        cfg = Config(experiment_name=experiment_name)
-        cfg.dropout = dropout
-        main(cfg, folds=folds)
-

@@ -235,7 +235,7 @@ class Config:
 
     # reinit
     reinit_pooler: bool = True
-    reinit_layers: int = 1
+    reinit_layers: int = 4
 
     # pooler
     pooler_enable: bool = True
@@ -256,7 +256,7 @@ class Config:
     crossentropy_max: int = 4
 
     accumulate_grad_batches: int = 1
-    gradient_clipping: int = 0.2
+    gradient_clipping: int = 0.5
 
     dropout_bert: float = 0
 
@@ -993,11 +993,10 @@ if __name__ == "__main__":
     # baseline
     for accumulate_grad_batches in [2, 4]:
         for lr_bert in [3e-5, 5e-5]:
-            for gradient_clipping in [1, 2]:
-                cfg = Config(experiment_name=experiment_name)
-                cfg.simple_structure = True
-                cfg.accumulate_grad_batches = accumulate_grad_batches
-                cfg.lr_bert = lr_bert
-                cfg.epochs = 12
-                cfg.epochs_max = 12
-                main(cfg, folds=folds)
+            cfg = Config(experiment_name=experiment_name)
+            cfg.simple_structure = True
+            cfg.accumulate_grad_batches = accumulate_grad_batches
+            cfg.lr_bert = lr_bert
+            cfg.epochs = 12
+            cfg.epochs_max = 12
+            main(cfg, folds=folds)

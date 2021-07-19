@@ -238,7 +238,7 @@ class Config:
     reinit_layers: int = 4
 
     # pooler
-    pooler_enable: bool = True
+    pooler_enable: bool = False
 
     word_axis: bool = True
 
@@ -987,23 +987,29 @@ def config_large(cfg: Config, nlp_model_name: str):
 
 
 if __name__ == "__main__":
-    experiment_name = "roberta-base crossentropy / KLDivLoss"
+    experiment_name = "roberta-base linear_vocab_enable"
     folds = [0, 1, 2, 3, 4]
 
     # baseline
-    for crossentropy_range in [(-6, 4), (-5, 3)]:
+    """
+    for reinit_layers in [0, 1]:
+        for gradient_clipping in [0, 0.2, 0.5]:
+            cfg = Config(experiment_name=experiment_name)
+            cfg.linear_vocab_enable = True
+            cfg.reinit_layers = reinit_layers
+            cfg.gradient_clipping = gradient_clipping
+            main(cfg, folds=folds)
+
+    for simple_structure in [True]:
         cfg = Config(experiment_name=experiment_name)
-        cfg.crossentropy = True
-        cfg.crossentropy_min = crossentropy_range[0]
-        cfg.crossentropy_max = crossentropy_range[1]
+        cfg.linear_vocab_enable = True
+        cfg.simple_structure = simple_structure
         main(cfg, folds=folds)
-
-    cfg = Config(experiment_name=experiment_name)
-    cfg.kl_div_enable = True
-    main(cfg, folds=folds)
-
-    for dropout in [0, 0.1, 0.2, 0.5]:
+    """
+    for linear_vocab_dim in [8, 16]:
         cfg = Config(experiment_name=experiment_name)
-        cfg.dropout = dropout
+        cfg.linear_vocab_enable = True
+        cfg.simple_structure = True
+        cfg.linear_vocab_dim = linear_vocab_dim
         main(cfg, folds=folds)
 

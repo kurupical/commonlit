@@ -987,23 +987,15 @@ def config_large(cfg: Config, nlp_model_name: str):
 
 
 if __name__ == "__main__":
-    experiment_name = "roberta-base crossentropy / KLDivLoss"
-    folds = [0, 1, 2, 3, 4]
+    experiment_name = "roberta-large"
+    folds = [0]
 
     # baseline
-    for crossentropy_range in [(-6, 4), (-5, 3)]:
-        cfg = Config(experiment_name=experiment_name)
-        cfg.crossentropy = True
-        cfg.crossentropy_min = crossentropy_range[0]
-        cfg.crossentropy_max = crossentropy_range[1]
-        main(cfg, folds=folds)
-
-    cfg = Config(experiment_name=experiment_name)
-    cfg.kl_div_enable = True
-    main(cfg, folds=folds)
-
-    for dropout in [0, 0.1, 0.2, 0.5]:
-        cfg = Config(experiment_name=experiment_name)
-        cfg.dropout = dropout
-        main(cfg, folds=folds)
-
+    for lr_bert in [2e-5, 3e-5, 5e-5]:
+        for batch_size in [8, 16]:
+            cfg = Config(experiment_name=experiment_name)
+            cfg.nlp_model_name = "roberta-large"
+            cfg.batch_size = batch_size
+            cfg.simple_structure = True
+            cfg.lr_bert = lr_bert
+            main(cfg, folds=folds)

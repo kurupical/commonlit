@@ -235,7 +235,7 @@ class Config:
 
     # reinit
     reinit_pooler: bool = True
-    reinit_layers: int = 1
+    reinit_layers: int = 4
 
     # pooler
     pooler_enable: bool = True
@@ -991,8 +991,8 @@ if __name__ == "__main__":
     folds = [0, 1, 2, 3, 4]
 
     # baseline
-    for reinit_layers in [0, 1, 2]:
-        for gradient_clipping in [0, 0.2, 0.5]:
+    for reinit_layers in [2, 3, 4]:
+        for gradient_clipping in [0.2, 0.5]:
             cfg = Config(experiment_name=experiment_name)
             cfg.simple_structure = False
             cfg.hidden_stack_enable = True

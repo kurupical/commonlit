@@ -235,10 +235,10 @@ class Config:
 
     # reinit
     reinit_pooler: bool = True
-    reinit_layers: int = 1
+    reinit_layers: int = 4
 
     # pooler
-    pooler_enable: bool = True
+    pooler_enable: bool = False
 
     word_axis: bool = True
 
@@ -991,6 +991,7 @@ if __name__ == "__main__":
     folds = [0, 1, 2, 3, 4]
 
     # baseline
+    """
     for reinit_layers in [0, 1]:
         for gradient_clipping in [0, 0.2, 0.5]:
             cfg = Config(experiment_name=experiment_name)
@@ -998,6 +999,12 @@ if __name__ == "__main__":
             cfg.reinit_layers = reinit_layers
             cfg.gradient_clipping = gradient_clipping
             main(cfg, folds=folds)
+    """
+    for pooler_enable in [False, True]:
+        cfg = Config(experiment_name=experiment_name)
+        cfg.attention_pool_enable = True
+        cfg.pooler_enable = pooler_enable
+        main(cfg, folds=folds)
 
     for simple_structure in [True]:
         cfg = Config(experiment_name=experiment_name)

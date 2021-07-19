@@ -25,6 +25,8 @@ from collections import OrderedDict
 from torch.nn.utils import weight_norm
 import copy
 import timm
+from pytorch_lightning.utilities import rank_zero_warn
+from typing import Optional
 
 class CommonLitDataset(Dataset):
     def __init__(self, df, tokenizer, cfg, transforms=None):
@@ -39,9 +41,9 @@ class CommonLitDataset(Dataset):
     def __getitem__(self, index):
         row = self.df.iloc[index]
 
-        text = row["excerpt"]
+        text_original = row["excerpt"]
 
-        text = self.tokenizer(text,
+        text = self.tokenizer(text_original,
                               padding="max_length",
                               max_length=self.cfg.max_length,
                               truncation=True,
@@ -54,8 +56,11 @@ class CommonLitDataset(Dataset):
         token_type_ids = text["token_type_ids"][0]
         std = row["standard_error"]
 
+        features = ((row[self.cfg.feature_columns].fillna(0).values - self.cfg.feature_mean) / self.cfg.feature_std)
+        features = torch.tensor(features, dtype=torch.float)
+
         target = torch.tensor(row["target"], dtype=torch.float)
-        return input_ids_masked, attention_mask, token_type_ids, input_ids, target, std
+        return input_ids_masked, attention_mask, token_type_ids, input_ids, features, target, std
 
 class LSTMModule(nn.Module):
     def __init__(self, cfg, hidden_size):
@@ -155,7 +160,7 @@ class TemporalConvNet(nn.Module):
         return self.network(x)
 
 
-class NoActivation(nn.Linear):
+class NoActivation(nn.Module):
     def __init__(self):
         super(NoActivation, self).__init__()
 
@@ -165,7 +170,7 @@ class NoActivation(nn.Linear):
 @dataclasses.dataclass
 class Config:
     experiment_name: str
-    seed: int = 19900222
+    seed: int = 10
     debug: bool = False
     fold: int = 0
 
@@ -174,15 +179,15 @@ class Config:
     linear_vocab_dim_1: int = 64
     linear_vocab_dim: int = 16
     linear_perplexity_dim: int = 64
-    linear_final_dim: int = 64
-    dropout: float = 0.2
-    dropout_stack: float = 0.1
-    dropout_output_hidden: float = 0.2
+    linear_final_dim: int = 256
+    dropout: float = 0
+    dropout_stack: float = 0
+    dropout_output_hidden: float = 0
     dropout_attn: float = 0
     batch_size: int = 32
 
     lr_bert: float = 3e-5
-    lr_fc: float = 1e-3
+    lr_fc: float = 5e-5
     lr_rnn: float = 1e-3
     lr_tcn: float = 1e-3
     lr_cnn: float = 1e-3
@@ -240,7 +245,7 @@ class Config:
     # pooler
     pooler_enable: bool = True
 
-    word_axis: bool = True
+    word_axis: bool = False
 
     # conv1d
     conv1d_num: int = 1
@@ -256,9 +261,11 @@ class Config:
     crossentropy_max: int = 4
 
     accumulate_grad_batches: int = 1
-    gradient_clipping: int = 0.5
+    gradient_clipping: int = 0.2
 
     dropout_bert: float = 0
+
+    feature_enable: bool = False
 
 class Lambda(nn.Module):
     def __init__(self, func):
@@ -289,59 +296,63 @@ class CommonLitModule(LightningModule):
         self.tokenizer = AutoTokenizer.from_pretrained(self.cfg.nlp_model_name)
 
         # setting bert dropout
-        for layer in self.bert.encoder.layer:
-            for module in layer.modules():
-                if isinstance(module, nn.Dropout):
-                    module.p = self.cfg.dropout_bert
-
-        if "gpt" in self.cfg.nlp_model_name:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
+        for module in self.bert.modules():
+            if isinstance(module, nn.Dropout):
+                module.p = self.cfg.dropout_bert
         self.dropout_bert_stack = nn.Dropout(self.cfg.dropout_stack)
         pl.seed_everything(self.cfg.seed)
 
         # network cfg
         hidden_size = 0
         if self.cfg.linear_vocab_enable:
-            hidden_size += self.cfg.linear_final_dim
-            self.linear_vocab = nn.Sequential(
-                nn.Linear(self.bert.config.hidden_size, self.cfg.linear_vocab_dim_1),
-                nn.Dropout(self.cfg.dropout),
-                self.cfg.activation(),
-                nn.Linear(self.cfg.linear_vocab_dim_1, self.cfg.linear_vocab_dim),
-                nn.Dropout(self.cfg.dropout),
-                self.cfg.activation()
-            )
-            self.linear_vocab_final = nn.Sequential(
-                nn.Linear(self.cfg.linear_vocab_dim*self.cfg.max_length, self.cfg.linear_final_dim),
-                # nn.BatchNorm1d(self.cfg.linear_final_dim),
-                self.cfg.activation(),
-                nn.Dropout(self.cfg.dropout)
-            )
-        if self.cfg.self_attention_enable:
-            hidden_size += self.cfg.linear_final_dim
-            if self.cfg.cnn_model_name == "SimpleConv2D":
-                self.convnet = nn.Sequential(
-                    nn.Conv2d(self.bert.config.num_hidden_layers * self.bert.config.num_attention_heads,
-                              self.cfg.conv2d_hidden_channel, kernel_size=(1, 1), stride=(1, 1), bias=False),
-                    nn.ReLU(),
-                    nn.Conv2d(self.cfg.conv2d_hidden_channel,
-                              1, kernel_size=(1, 1), stride=(1, 1), bias=False),
-                    nn.ReLU(),
-                    Lambda(lambda x: x.view(x.size(0), -1)),
-                )
-                self.convnet.num_features = self.cfg.max_length ** 2
+            if "funnel" in self.cfg.nlp_model_name:
+                print("funnelはlinear_vocab_enable無効です")
+                self.cfg.linear_vocab_enable = False
             else:
-                self.convnet = timm.create_model(self.cfg.cnn_model_name,
-                                                 pretrained=self.cfg.cnn_pretrained,
-                                                 num_classes=0)
-                if "efficientnet" in self.cfg.cnn_model_name:
-                    self.convnet.conv_stem = nn.Conv2d(
-                        self.bert.config.num_hidden_layers * self.bert.config.num_attention_heads,
-                        32, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
-                if "resnet" in self.cfg.cnn_model_name:
-                    self.convnet.conv1 = nn.Conv2d(
-                        self.bert.config.num_hidden_layers * self.bert.config.num_attention_heads,
-                        64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False)
+                hidden_size += self.cfg.linear_final_dim
+                self.linear_vocab = nn.Sequential(
+                    nn.Linear(self.bert.config.hidden_size, self.cfg.linear_vocab_dim_1),
+                    nn.Dropout(self.cfg.dropout),
+                    self.cfg.activation(),
+                    nn.Linear(self.cfg.linear_vocab_dim_1, self.cfg.linear_vocab_dim),
+                    nn.Dropout(self.cfg.dropout),
+                    self.cfg.activation()
+                )
+                self.linear_vocab_final = nn.Sequential(
+                    nn.Linear(self.cfg.linear_vocab_dim*self.cfg.max_length, self.cfg.linear_final_dim),
+                    # nn.BatchNorm1d(self.cfg.linear_final_dim),
+                    self.cfg.activation(),
+                    nn.Dropout(self.cfg.dropout)
+                )
+        if self.cfg.self_attention_enable:
+            if "funnel" in self.cfg.nlp_model_name:
+                print("funnelはself_attention_enable無効です")
+                self.cfg.self_attention_enable = False
+            else:
+                hidden_size += self.cfg.linear_final_dim
+                if self.cfg.cnn_model_name == "SimpleConv2D":
+                    self.convnet = nn.Sequential(
+                        nn.Conv2d(self.bert.config.num_hidden_layers * self.bert.config.num_attention_heads,
+                                  self.cfg.conv2d_hidden_channel, kernel_size=(1, 1), stride=(1, 1), bias=False),
+                        nn.ReLU(),
+                        nn.Conv2d(self.cfg.conv2d_hidden_channel,
+                                  1, kernel_size=(1, 1), stride=(1, 1), bias=False),
+                        nn.ReLU(),
+                        Lambda(lambda x: x.view(x.size(0), -1)),
+                    )
+                    self.convnet.num_features = self.cfg.max_length ** 2
+                else:
+                    self.convnet = timm.create_model(self.cfg.cnn_model_name,
+                                                     pretrained=self.cfg.cnn_pretrained,
+                                                     num_classes=0)
+                    if "efficientnet" in self.cfg.cnn_model_name:
+                        self.convnet.conv_stem = nn.Conv2d(
+                            self.bert.config.num_hidden_layers * self.bert.config.num_attention_heads,
+                            32, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
+                    if "resnet" in self.cfg.cnn_model_name:
+                        self.convnet.conv1 = nn.Conv2d(
+                            self.bert.config.num_hidden_layers * self.bert.config.num_attention_heads,
+                            64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False)
 
             self.linear_conv_final = nn.Sequential(
                 nn.Linear(self.convnet.num_features, self.cfg.linear_final_dim),
@@ -358,30 +369,34 @@ class CommonLitModule(LightningModule):
                 nn.Dropout(self.cfg.dropout)
             )
         if self.cfg.rnn_module_num > 0:
-            hidden_size += self.cfg.linear_final_dim
-            self.lstm = self.make_lstm_module()
-            if self.cfg.bidirectional:
-                if self.cfg.word_axis:
-                    lstm_size = int(self.cfg.max_length * len(self.cfg.rnn_hidden_indice) * (
-                                (2 * self.cfg.rnn_module_shrink_ratio) ** self.cfg.rnn_module_num))
-                else:
-                    lstm_size = int(self.bert.config.hidden_size * len(self.cfg.rnn_hidden_indice) * (
-                                (2 * self.cfg.rnn_module_shrink_ratio) ** self.cfg.rnn_module_num))
+            if "funnel" in self.cfg.nlp_model_name:
+                print("funnelはrnn無効です")
+                self.cfg.rnn_module_num = 0
             else:
-                if self.cfg.word_axis:
-                    lstm_size = int(self.cfg.max_length * len(self.cfg.rnn_hidden_indice) * (
-                                self.cfg.rnn_module_shrink_ratio ** self.cfg.rnn_module_num))
-
+                hidden_size += self.cfg.linear_final_dim
+                self.lstm = self.make_lstm_module()
+                if self.cfg.bidirectional:
+                    if self.cfg.word_axis:
+                        lstm_size = int(self.cfg.max_length * len(self.cfg.rnn_hidden_indice) * (
+                                    (2 * self.cfg.rnn_module_shrink_ratio) ** self.cfg.rnn_module_num))
+                    else:
+                        lstm_size = int(self.bert.config.hidden_size * len(self.cfg.rnn_hidden_indice) * (
+                                    (2 * self.cfg.rnn_module_shrink_ratio) ** self.cfg.rnn_module_num))
                 else:
-                    lstm_size = int(self.bert.config.hidden_size * len(self.cfg.rnn_hidden_indice) * (
-                                self.cfg.rnn_module_shrink_ratio ** self.cfg.rnn_module_num))
+                    if self.cfg.word_axis:
+                        lstm_size = int(self.cfg.max_length * len(self.cfg.rnn_hidden_indice) * (
+                                    self.cfg.rnn_module_shrink_ratio ** self.cfg.rnn_module_num))
 
-            self.linear_lstm_final = nn.Sequential(
-                nn.Linear(lstm_size, self.cfg.linear_final_dim),
-                # nn.BatchNorm1d(self.cfg.linear_final_dim),
-                self.cfg.activation(),
-                nn.Dropout(self.cfg.dropout)
-            )
+                    else:
+                        lstm_size = int(self.bert.config.hidden_size * len(self.cfg.rnn_hidden_indice) * (
+                                    self.cfg.rnn_module_shrink_ratio ** self.cfg.rnn_module_num))
+
+                self.linear_lstm_final = nn.Sequential(
+                    nn.Linear(lstm_size, self.cfg.linear_final_dim),
+                    # nn.BatchNorm1d(self.cfg.linear_final_dim),
+                    self.cfg.activation(),
+                    nn.Dropout(self.cfg.dropout)
+                )
         if self.cfg.tcn_module_enable:
             hidden_size += self.cfg.linear_final_dim
             if self.cfg.word_axis:
@@ -408,6 +423,13 @@ class CommonLitModule(LightningModule):
                 nn.Dropout(self.cfg.dropout),
                 nn.Linear(self.cfg.max_length ** 2, self.cfg.linear_final_dim),
                 # nn.BatchNorm1d(self.cfg.linear_final_dim),
+                self.cfg.activation(),
+                nn.Dropout(self.cfg.dropout)
+            )
+        if self.cfg.feature_enable:
+            hidden_size += self.cfg.linear_final_dim
+            self.linear_feature = nn.Sequential(
+                nn.Linear(17, self.cfg.linear_final_dim),
                 self.cfg.activation(),
                 nn.Dropout(self.cfg.dropout)
             )
@@ -462,12 +484,15 @@ class CommonLitModule(LightningModule):
         self.df_val: pd.DataFrame
         self.dataset_train: Dataset
         self.dataset_val: Dataset
+        self.feature_columns: list
 
         self.best_rmse = np.inf
         self.reinit_bert()
 
     def reinit_bert(self):
         def get_model_type(x):
+            if "distilbert" in x: return "distilbert"
+            if "albert" in x: return "albert"
             if "roberta" in x: return "roberta"
             if "bert" in x: return "bert"
 
@@ -485,14 +510,20 @@ class CommonLitModule(LightningModule):
 
         # re-init layers
         if self.cfg.reinit_layers > 0:
-            if "bert" in self.cfg.nlp_model_name or "roberta" in self.cfg.nlp_model_name:
+            if "albert" in self.cfg.nlp_model_name:
+                raise ValueError("albertはreinitしちゃだめ")
+
+            elif "bert" in self.cfg.nlp_model_name or "roberta" in self.cfg.nlp_model_name:
                 if self.cfg.prep_enable:
                     if get_model_type(self.cfg.nlp_model_name) == "bert":
                         layers = self.bert.bert.encoder.layer[-self.cfg.reinit_layers:]
                     elif get_model_type(self.cfg.nlp_model_name) == "roberta":
                         layers = self.bert.roberta.encoder.layer[-self.cfg.reinit_layers:]
                 else:
-                    layers = self.bert.encoder.layer[-self.cfg.reinit_layers:]
+                    if get_model_type(self.cfg.nlp_model_name) == "distilbert":
+                        layers = self.bert.transformer.layer[-self.cfg.reinit_layers:]
+                    else:
+                        layers = self.bert.encoder.layer[-self.cfg.reinit_layers:]
                 for layer in layers:
                     for module in layer.modules():
                         if isinstance(module, nn.Linear):
@@ -510,29 +541,10 @@ class CommonLitModule(LightningModule):
                             module.weight.data.fill_(1.0)
 
             elif "xlnet" in self.cfg.nlp_model_name:
-                from transformers.models.roberta import RobertaModel
-                for layer in self.bert.transformer.layer[-self.cfg.reinit_layers:]:
+                for layer in self.bert.layer[-self.cfg.reinit_layers:]:
                     for module in layer.modules():
-                        if isinstance(module, (nn.Linear, nn.Embedding)):
-                            module.weight.data.normal_(mean=0.0, std=self.bert.transformer.config.initializer_range)
-                            if isinstance(module, nn.Linear) and module.bias is not None:
-                                module.bias.data.zero_()
-                        elif isinstance(module, nn.LayerNorm):
-                            module.bias.data.zero_()
-                            module.weight.data.fill_(1.0)
-                        elif isinstance(module, XLNetRelativeAttention):
-                            for param in [
-                                module.q,
-                                module.k,
-                                module.v,
-                                module.o,
-                                module.r,
-                                module.r_r_bias,
-                                module.r_s_bias,
-                                module.r_w_bias,
-                                module.seg_embed,
-                            ]:
-                                param.data.normal_(mean=0.0, std=self.bert.transformer.config.initializer_range)
+                        self.bert._init_weights(module)
+
             elif "luke" in self.cfg.nlp_model_name:
                 if self.cfg.prep_enable:
                     raise NotImplementedError
@@ -553,6 +565,10 @@ class CommonLitModule(LightningModule):
                         elif isinstance(module, nn.LayerNorm):
                             module.bias.data.zero_()
                             module.weight.data.fill_(1.0)
+            elif "funnel" in self.cfg.nlp_model_name:
+                for layer in self.bert.encoder.blocks[2][-self.cfg.reinit_layers:]:
+                    for module in layer.modules():
+                        self.bert._init_weights(module)
         """
         for layer in [self.linear1, self.linear2, self.linear1_std, self.linear2_std, self.linear_perp, self.linear_vocab,
                       self.linear_tcn_final, self.linear_lstm_final, self.linear_hidden_final,
@@ -579,7 +595,7 @@ class CommonLitModule(LightningModule):
                 hidden_size = int(hidden_size * self.cfg.rnn_module_shrink_ratio)
         return nn.Sequential(OrderedDict(ret))
 
-    def forward(self, input_ids_masked, attention_mask, token_type_ids, input_ids):
+    def forward(self, input_ids_masked, attention_mask, token_type_ids, input_ids, features):
         def f(x_in, perplexity=None):
             x_in = F.dropout(x_in, p=self.cfg.multi_dropout_ratio, training=True)
             if perplexity is not None:
@@ -604,10 +620,23 @@ class CommonLitModule(LightningModule):
         if not self.cfg.prep_enable:
             x = self.bert(input_ids=input_ids_masked,
                           attention_mask=attention_mask,
-                          token_type_ids=token_type_ids,
                           output_attentions=True,
                           output_hidden_states=True)
-            x = [x[0], x[2], x[3], x[1]]
+            if "deberta" in self.cfg.nlp_model_name:
+                x = [x[0], x[1], x[2]]
+            elif "xlnet" in self.cfg.nlp_model_name:
+                if len(x) == 4:
+                    x = [x[0], x[2], x[3], x[1]]
+                else:
+                    x = [x[0], x[1], x[2]]
+            elif "albert" in self.cfg.nlp_model_name:
+                x = [x[0], x[1]]
+            elif "distilbert" in self.cfg.nlp_model_name:
+                x = [x[0], x[1], x[2]]
+            elif "funnel" in self.cfg.nlp_model_name:
+                x = [x[0], x[1], x[2]]
+            else:
+                x = [x[0], x[2], x[3], x[1]]
         elif "funnel" in self.cfg.nlp_model_name:
             x = self.bert.funnel(input_ids=input_ids_masked,
                                  attention_mask=attention_mask,
@@ -678,16 +707,17 @@ class CommonLitModule(LightningModule):
             x_bert.append(xx)
         if self.cfg.hidden_stack_enable:
             if "albert" in self.cfg.nlp_model_name:
-                x_bert.append(x[0].mean(dim=1))
+                xx = self.linear_hidden_final(x[0].mean(dim=1))
+                x_bert.append(xx)
             else:
                 if "funnel" in self.cfg.nlp_model_name:
-                    xx = torch.stack([self.dropout_bert_stack(xx) for xx in x[1][-3:]]).mean(dim=0)
+                    xx = torch.stack([self.dropout_bert_stack(xx) for xx in x[1][-3:]]).mean(dim=[0, 2])
                 else:
                     xx = torch.stack([self.dropout_bert_stack(xx) for xx in x[1][-4:]]).mean(dim=0)
-                xx = torch.sum(
-                    xx * attention_mask.unsqueeze(-1), dim=1, keepdim=False
-                )
-                xx = xx / torch.sum(attention_mask, dim=-1, keepdim=True)
+                    xx = torch.sum(
+                        xx * attention_mask.unsqueeze(-1), dim=1, keepdim=False
+                    )
+                    xx = xx / torch.sum(attention_mask, dim=-1, keepdim=True)
                 xx = self.linear_hidden_final(xx)
                 x_bert.append(xx)
 
@@ -710,6 +740,9 @@ class CommonLitModule(LightningModule):
             xx = torch.cat([xx for xx in x[2]], dim=1).mean(dim=1).reshape(len(input_ids), -1)
             xx = self.linear_attention_pool_final(xx)
             x_bert.append(xx)
+        if self.cfg.feature_enable:
+            xx = self.linear_feature(features)
+            x_bert.append(xx)
 
         x_bert = torch.cat(x_bert, dim=1)
 
@@ -729,8 +762,8 @@ class CommonLitModule(LightningModule):
         scheduler = self.lr_schedulers()
         scheduler.step()
 
-        input_ids_masked, attention_mask, token_type_ids, input_ids, target, std = batch
-        output_mean, output_std = self.forward(input_ids_masked, attention_mask, token_type_ids, input_ids)
+        input_ids_masked, attention_mask, token_type_ids, input_ids, features, target, std = batch
+        output_mean, output_std = self.forward(input_ids_masked, attention_mask, token_type_ids, input_ids, features)
 
         if self.cfg.kl_div_enable:
             dist_pred = torch.distributions.Normal(output_mean.flatten(), output_std.flatten())
@@ -747,8 +780,8 @@ class CommonLitModule(LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        input_ids_masked, attention_mask, token_type_ids, input_ids, target, std = batch
-        output_mean, output_std = self.forward(input_ids_masked, attention_mask, token_type_ids, input_ids)
+        input_ids_masked, attention_mask, token_type_ids, input_ids, features, target, std = batch
+        output_mean, output_std = self.forward(input_ids_masked, attention_mask, token_type_ids, input_ids, features)
 
         if self.cfg.kl_div_enable:
             dist_pred = torch.distributions.Normal(output_mean.flatten(), output_std.flatten())
@@ -798,10 +831,46 @@ class CommonLitModule(LightningModule):
             df_val.to_csv(f"{self.output_dir}/val_fold{self.cfg.fold}_best.csv", index=False)
 
     def setup(self, stage=None):
+        def feature_engineering(df):
+            def total_words(x):
+                return len(x.split(" "))
+
+            def total_unique_words(x):
+                return len(np.unique(x.split(" ")))
+
+            def total_charactors(x):
+                x = x.replace(" ", "")
+                return len(x)
+
+            def total_sentence(x):
+                x = x.replace("!", "[end]").replace("?", "[end]").replace(".", "[end]")
+                return len(x.split("[end]"))
+
+            df_ret = df[["id", "excerpt", "target", "standard_error", "kfold"]]
+            excerpt = df["excerpt"].values
+            df_ret["total_words"] = [total_words(x) for x in excerpt]
+            df_ret["total_unique_words"] = [total_unique_words(x) for x in excerpt]
+            df_ret["total_characters"] = [total_charactors(x) for x in excerpt]
+            df_ret["total_sentence"] = [total_sentence(x) for x in excerpt]
+
+            df_ret["div_sentence_characters"] = df_ret["total_sentence"] / df_ret["total_characters"]
+            df_ret["div_sentence_words"] = df_ret["total_sentence"] / df_ret["total_words"]
+            df_ret["div_characters_words"] = df_ret["total_characters"] / df_ret["total_words"]
+            df_ret["div_words_unique_words"] = df_ret["total_words"] / df_ret["total_unique_words"]
+
+            for i, word in enumerate(["!", "?", "(", ")", "'", '"', ";", ".", ","]):
+                df_ret[f"count_word_special_{i}"] = [x.count(word) for x in excerpt]
+
+            return df_ret.fillna(0)
+
         df = pd.read_csv("input/commonlitreadabilityprize/train_folds.csv")
         if self.cfg.debug:
             df = df.iloc[::30]
 
+        df = feature_engineering(df)
+        self.cfg.feature_columns = [x for x in df.columns if x not in ["id", "excerpt", "target", "kfold", "standard_error"]]
+        self.cfg.feature_mean = df[self.cfg.feature_columns].mean().values
+        self.cfg.feature_std = df[self.cfg.feature_columns].std().values
         self.df_train = df[df["kfold"] != self.cfg.fold].reset_index(drop=True)
         self.df_val = df[df["kfold"] == self.cfg.fold].reset_index(drop=True)
 
@@ -810,6 +879,7 @@ class CommonLitModule(LightningModule):
                                                  (self.df_train["target"] < cfg.augmantation_range[1])]])
         self.dataset_train = CommonLitDataset(df=self.df_train,
                                               tokenizer=self.tokenizer,
+
                                               cfg=self.cfg)
         self.dataset_val = CommonLitDataset(df=self.df_val,
                                             tokenizer=self.tokenizer,
@@ -818,39 +888,16 @@ class CommonLitModule(LightningModule):
     def configure_optimizers(self):
         def extract_params(named_parameters, lr, weight_decay, no_decay=False):
             ret = {}
-            no_decay_ary = ["bias", "LayerNorm.weight"]
+            no_decay_ary = ["bias", "LayerNorm.weight", "pooler"]
 
             if no_decay:
                 ret["params"] = [p for n, p in named_parameters if not any(nd in n for nd in no_decay_ary)]
                 ret["weight_decay"] = 0
             else:
-                ret["params"] = [p for n, p in named_parameters if any(nd in n for nd in no_decay_ary)]
+                ret["params"] = [p for n, p in named_parameters if any(nd in n for nd in no_decay_ary) and "pooler" not in n]
                 ret["weight_decay"] = weight_decay
             ret["lr"] = lr
             return ret
-
-        def bert_params():
-            params = []
-            no_decay_ary = ["bias", "LayerNorm.weight"]
-            layers = self.bert.config.num_hidden_layers
-            for i in range(layers):
-                # models
-                # parameters
-                ret = {}
-                ret["params"] = [p for n, p in self.bert.named_parameters()
-                                 if f"encoder.layer.{i}." in n and not any(nd in n for nd in no_decay_ary)]
-                ret["weight_decay"] = self.cfg.weight_decay
-                ret["lr"] = self.cfg.lr_bert * (self.cfg.lr_bert_decay ** (layers - i + 1))
-                params.append(ret)
-
-                ret = {}
-                ret["params"] = [p for n, p in self.bert.named_parameters()
-                                 if f"bert.encoder.layer.{i}." in n and any(nd in n for nd in no_decay_ary)]
-                ret["weight_decay"] = 0
-                ret["lr"] = self.cfg.lr_bert * (self.cfg.lr_bert_decay ** (layers - i + 1))
-                params.append(ret)
-            return params
-
 
         params = []
         if self.cfg.prep_enable:
@@ -866,18 +913,9 @@ class CommonLitModule(LightningModule):
                 params.append({"params": self.bert.cls.parameters(), "weight_decay": self.cfg.weight_decay, "lr": self.cfg.lr_bert})
             else:
                 raise ValueError("mask用のparameterありません")
-        params.extend(bert_params())
-        if self.cfg.prep_enable:
-            params.append(extract_params(self.linear1.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
-            params.append(extract_params(self.linear1.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
-            params.append(extract_params(self.linear2.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
-            params.append(extract_params(self.linear2.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
-            params.append(extract_params(self.linear1_std.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
-            params.append(extract_params(self.linear1_std.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
-            params.append(extract_params(self.linear2_std.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
-            params.append(extract_params(self.linear2_std.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
-            params.append(extract_params(self.linear_perp.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
-            params.append(extract_params(self.linear_perp.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
+        params.append(extract_params(self.bert.named_parameters(), lr=self.cfg.lr_bert, weight_decay=self.cfg.weight_decay, no_decay=False))
+        params.append(extract_params(self.bert.named_parameters(), lr=self.cfg.lr_bert, weight_decay=0, no_decay=True))
+
         if self.cfg.linear_vocab_enable:
             params.append(extract_params(self.linear_vocab.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
             params.append(extract_params(self.linear_vocab.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
@@ -907,9 +945,22 @@ class CommonLitModule(LightningModule):
         if self.cfg.simple_structure:
             params.append(extract_params(self.linear_simple.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
             params.append(extract_params(self.linear_simple.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
+        else:
+            params.append(extract_params(self.linear1.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
+            params.append(extract_params(self.linear1.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
+            params.append(extract_params(self.linear2.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
+            params.append(extract_params(self.linear2.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
+            params.append(extract_params(self.linear1_std.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
+            params.append(extract_params(self.linear1_std.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
+            params.append(extract_params(self.linear2_std.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
+            params.append(extract_params(self.linear2_std.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
+
         if self.cfg.pooler_enable:
             params.append(extract_params(self.bert.pooler.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
             params.append(extract_params(self.bert.pooler.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
+        if self.cfg.feature_enable:
+            params.append(extract_params(self.linear_feature.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
+            params.append(extract_params(self.linear_feature.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
 
         optimizer = self.cfg.optimizer(params)
         num_warmup_steps = int(self.cfg.epochs_max * len(self.df_train) / self.cfg.batch_size * self.cfg.warmup_ratio)
@@ -922,11 +973,43 @@ class CommonLitModule(LightningModule):
 
     def train_dataloader(self):
         return DataLoader(self.dataset_train,
-                          batch_size=self.cfg.batch_size)
+                          batch_size=self.cfg.batch_size,
+                          shuffle=True)
 
     def val_dataloader(self):
         return DataLoader(self.dataset_val,
                           batch_size=self.cfg.batch_size)
+
+class CustomModelCheckpoint(ModelCheckpoint):
+    def check_monitor_top_k(self, trainer: 'pl.Trainer', current: Optional[torch.Tensor] = None) -> bool:
+        if current is None:
+            return False
+
+        if self.save_top_k == -1:
+            return True
+        if current.cpu().numpy() > 0.55:
+            should_update_best_and_save = False
+        else:
+            less_than_k_models = len(self.best_k_models) < self.save_top_k
+            if less_than_k_models:
+                return True
+
+            if not isinstance(current, torch.Tensor):
+                rank_zero_warn(
+                    f"{current} is supposed to be a `torch.Tensor`. Saving checkpoint may not work correctly."
+                    f" HINT: check the value of {self.monitor} in your validation loop",
+                    RuntimeWarning,
+                )
+                current = torch.tensor(current)
+
+            monitor_op = {"min": torch.lt, "max": torch.gt}[self.mode]
+            should_update_best_and_save = monitor_op(current, self.best_k_models[self.kth_best_model_path])
+
+            # If using multiple devices, make sure all processes are unanimous on the decision.
+            should_update_best_and_save = trainer.training_type_plugin.reduce_boolean_decision(should_update_best_and_save)
+
+        return should_update_best_and_save
+
 
 def main(cfg_original: Config,
          folds: List):
@@ -937,13 +1020,15 @@ def main(cfg_original: Config,
         mlflow.pytorch.autolog(log_models=False)
         for key, value in cfg_original.__dict__.items():
             mlflow.log_param(key, value)
-        with open(f"{output_dir}/cfg.pickle", "wb") as f:
-            pickle.dump(cfg_original, f)
         for fold in folds:
             try:
                 cfg = copy.copy(cfg_original)
+                if "deberta" in cfg.nlp_model_name:
+                    cfg.pooler_enable = False
+                    cfg.reinit_pooler = False
+                    cfg.hidden_stack_enable = True
                 cfg.fold = fold
-                checkpoint_callback = ModelCheckpoint(
+                checkpoint_callback = CustomModelCheckpoint(
                     monitor='val_loss',
                     dirpath=output_dir,
                     filename=f'best_fold{fold}',
@@ -956,6 +1041,7 @@ def main(cfg_original: Config,
                                         output_dir=output_dir)
                 trainer = Trainer(gpus=1,
                                   precision=16,
+                                  auto_scale_batch_size=True,
                                   # amp_level="02",
                                   max_epochs=cfg.epochs,
                                   benchmark=True,
@@ -967,13 +1053,30 @@ def main(cfg_original: Config,
                                   callbacks=[checkpoint_callback])
 
                 trainer.fit(model)
+                with open(f"{output_dir}/cfg.pickle", "wb") as f:
+                    pickle.dump(cfg, f)
 
+                # 足切り1
+                if fold == 0 and model.best_rmse > 0.5:
+                    break
                 rmse += model.best_rmse
-                del trainer, model
+
+                if cfg.nlp_model_name in ["roberta-large", "luke-large"]:
+                    if fold == 0 and rmse > 0.47:
+                        break
+                    if fold == 1 and rmse / 2 > 0.465:
+                        break
+                    if fold == 2 and rmse / 3 > 0.48:
+                        break
+                    if fold == 3 and rmse / 4 > 0.474:
+                        break
+                del trainer, model, checkpoint_callback
                 gc.collect()
                 torch.cuda.empty_cache()
             except Exception as e:
                 print(e)
+                raise
+
         mlflow.log_metric("rmse_mean", rmse / len(folds))
 
 
@@ -987,23 +1090,22 @@ def config_large(cfg: Config, nlp_model_name: str):
 
 
 if __name__ == "__main__":
-    experiment_name = "roberta-base crossentropy / KLDivLoss"
+    experiment_name = "funnel_large tune"
     folds = [0, 1, 2, 3, 4]
 
-    # baseline
-    for crossentropy_range in [(-6, 4), (-5, 3)]:
-        cfg = Config(experiment_name=experiment_name)
-        cfg.crossentropy = True
-        cfg.crossentropy_min = crossentropy_range[0]
-        cfg.crossentropy_max = crossentropy_range[1]
-        main(cfg, folds=folds)
+    def common_config(cfg) -> Config:
+        cfg.pooler_enable = False
+        cfg.reinit_pooler = False
+        cfg.hidden_stack_enable = True
+        cfg.feature_enable = True
+        cfg.simple_structure = False
+        cfg.batch_size = 20
+        return cfg
 
-    cfg = Config(experiment_name=experiment_name)
-    cfg.kl_div_enable = True
-    main(cfg, folds=folds)
-
-    for dropout in [0, 0.1, 0.2, 0.5]:
-        cfg = Config(experiment_name=experiment_name)
-        cfg.dropout = dropout
-        main(cfg, folds=folds)
-
+    for nlp_model_name in ["funnel-transformer/large-base"]:
+        for reinit_layers in [4, 0]:
+            cfg = Config(experiment_name=experiment_name)
+            cfg = common_config(cfg)
+            cfg.reinit_layers = reinit_layers
+            cfg.nlp_model_name = nlp_model_name
+            main(cfg, folds=folds)

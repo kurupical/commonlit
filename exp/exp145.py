@@ -235,7 +235,7 @@ class Config:
 
     # reinit
     reinit_pooler: bool = True
-    reinit_layers: int = 1
+    reinit_layers: int = 4
 
     # pooler
     pooler_enable: bool = True

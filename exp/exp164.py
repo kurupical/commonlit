@@ -39,9 +39,9 @@ class CommonLitDataset(Dataset):
     def __getitem__(self, index):
         row = self.df.iloc[index]
 
-        text = row["excerpt"]
+        text_original = row["excerpt"]
 
-        text = self.tokenizer(text,
+        text = self.tokenizer(text_original,
                               padding="max_length",
                               max_length=self.cfg.max_length,
                               truncation=True,
@@ -54,8 +54,11 @@ class CommonLitDataset(Dataset):
         token_type_ids = text["token_type_ids"][0]
         std = row["standard_error"]
 
+        features = ((row[self.cfg.feature_columns].fillna(0).values - self.cfg.feature_mean) / self.cfg.feature_std)
+        features = torch.tensor(features, dtype=torch.float)
+
         target = torch.tensor(row["target"], dtype=torch.float)
-        return input_ids_masked, attention_mask, token_type_ids, input_ids, target, std
+        return input_ids_masked, attention_mask, token_type_ids, input_ids, features, target, std
 
 class LSTMModule(nn.Module):
     def __init__(self, cfg, hidden_size):
@@ -155,7 +158,7 @@ class TemporalConvNet(nn.Module):
         return self.network(x)
 
 
-class NoActivation(nn.Linear):
+class NoActivation(nn.Module):
     def __init__(self):
         super(NoActivation, self).__init__()
 
@@ -165,7 +168,7 @@ class NoActivation(nn.Linear):
 @dataclasses.dataclass
 class Config:
     experiment_name: str
-    seed: int = 19900222
+    seed: int = 19920224
     debug: bool = False
     fold: int = 0
 
@@ -179,7 +182,7 @@ class Config:
     dropout_stack: float = 0.1
     dropout_output_hidden: float = 0.2
     dropout_attn: float = 0
-    batch_size: int = 32
+    batch_size: int = 48
 
     lr_bert: float = 3e-5
     lr_fc: float = 1e-3
@@ -240,7 +243,7 @@ class Config:
     # pooler
     pooler_enable: bool = True
 
-    word_axis: bool = True
+    word_axis: bool = False
 
     # conv1d
     conv1d_num: int = 1
@@ -256,9 +259,11 @@ class Config:
     crossentropy_max: int = 4
 
     accumulate_grad_batches: int = 1
-    gradient_clipping: int = 0.5
+    gradient_clipping: int = 0.2
 
     dropout_bert: float = 0
+
+    feature_enable: bool = False
 
 class Lambda(nn.Module):
     def __init__(self, func):
@@ -289,10 +294,9 @@ class CommonLitModule(LightningModule):
         self.tokenizer = AutoTokenizer.from_pretrained(self.cfg.nlp_model_name)
 
         # setting bert dropout
-        for layer in self.bert.encoder.layer:
-            for module in layer.modules():
-                if isinstance(module, nn.Dropout):
-                    module.p = self.cfg.dropout_bert
+        for module in self.bert.modules():
+            if isinstance(module, nn.Dropout):
+                module.p = self.cfg.dropout_bert
 
         if "gpt" in self.cfg.nlp_model_name:
             self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -411,6 +415,13 @@ class CommonLitModule(LightningModule):
                 self.cfg.activation(),
                 nn.Dropout(self.cfg.dropout)
             )
+        if self.cfg.feature_enable:
+            hidden_size += self.cfg.linear_final_dim
+            self.linear_feature = nn.Sequential(
+                nn.Linear(17, self.cfg.linear_final_dim),
+                self.cfg.activation(),
+                nn.Dropout(self.cfg.dropout)
+            )
         if not self.cfg.simple_structure:
             if self.cfg.prep_enable:
                 self.linear_perp = nn.Sequential(
@@ -462,6 +473,7 @@ class CommonLitModule(LightningModule):
         self.df_val: pd.DataFrame
         self.dataset_train: Dataset
         self.dataset_val: Dataset
+        self.feature_columns: list
 
         self.best_rmse = np.inf
         self.reinit_bert()
@@ -579,7 +591,7 @@ class CommonLitModule(LightningModule):
                 hidden_size = int(hidden_size * self.cfg.rnn_module_shrink_ratio)
         return nn.Sequential(OrderedDict(ret))
 
-    def forward(self, input_ids_masked, attention_mask, token_type_ids, input_ids):
+    def forward(self, input_ids_masked, attention_mask, token_type_ids, input_ids, features):
         def f(x_in, perplexity=None):
             x_in = F.dropout(x_in, p=self.cfg.multi_dropout_ratio, training=True)
             if perplexity is not None:
@@ -607,7 +619,10 @@ class CommonLitModule(LightningModule):
                           token_type_ids=token_type_ids,
                           output_attentions=True,
                           output_hidden_states=True)
-            x = [x[0], x[2], x[3], x[1]]
+            if "deberta" in self.cfg.nlp_model_name:
+                x = [x[0], x[1], x[2]]
+            else:
+                x = [x[0], x[2], x[3], x[1]]
         elif "funnel" in self.cfg.nlp_model_name:
             x = self.bert.funnel(input_ids=input_ids_masked,
                                  attention_mask=attention_mask,
@@ -710,6 +725,9 @@ class CommonLitModule(LightningModule):
             xx = torch.cat([xx for xx in x[2]], dim=1).mean(dim=1).reshape(len(input_ids), -1)
             xx = self.linear_attention_pool_final(xx)
             x_bert.append(xx)
+        if self.cfg.feature_enable:
+            xx = self.linear_feature(features)
+            x_bert.append(xx)
 
         x_bert = torch.cat(x_bert, dim=1)
 
@@ -729,8 +747,8 @@ class CommonLitModule(LightningModule):
         scheduler = self.lr_schedulers()
         scheduler.step()
 
-        input_ids_masked, attention_mask, token_type_ids, input_ids, target, std = batch
-        output_mean, output_std = self.forward(input_ids_masked, attention_mask, token_type_ids, input_ids)
+        input_ids_masked, attention_mask, token_type_ids, input_ids, features, target, std = batch
+        output_mean, output_std = self.forward(input_ids_masked, attention_mask, token_type_ids, input_ids, features)
 
         if self.cfg.kl_div_enable:
             dist_pred = torch.distributions.Normal(output_mean.flatten(), output_std.flatten())
@@ -747,8 +765,8 @@ class CommonLitModule(LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        input_ids_masked, attention_mask, token_type_ids, input_ids, target, std = batch
-        output_mean, output_std = self.forward(input_ids_masked, attention_mask, token_type_ids, input_ids)
+        input_ids_masked, attention_mask, token_type_ids, input_ids, features, target, std = batch
+        output_mean, output_std = self.forward(input_ids_masked, attention_mask, token_type_ids, input_ids, features)
 
         if self.cfg.kl_div_enable:
             dist_pred = torch.distributions.Normal(output_mean.flatten(), output_std.flatten())
@@ -798,10 +816,46 @@ class CommonLitModule(LightningModule):
             df_val.to_csv(f"{self.output_dir}/val_fold{self.cfg.fold}_best.csv", index=False)
 
     def setup(self, stage=None):
+        def feature_engineering(df):
+            def total_words(x):
+                return len(x.split(" "))
+
+            def total_unique_words(x):
+                return len(np.unique(x.split(" ")))
+
+            def total_charactors(x):
+                x = x.replace(" ", "")
+                return len(x)
+
+            def total_sentence(x):
+                x = x.replace("!", "[end]").replace("?", "[end]").replace(".", "[end]")
+                return len(x.split("[end]"))
+
+            df_ret = df[["id", "excerpt", "target", "standard_error", "kfold"]]
+            excerpt = df["excerpt"].values
+            df_ret["total_words"] = [total_words(x) for x in excerpt]
+            df_ret["total_unique_words"] = [total_unique_words(x) for x in excerpt]
+            df_ret["total_characters"] = [total_charactors(x) for x in excerpt]
+            df_ret["total_sentence"] = [total_sentence(x) for x in excerpt]
+
+            df_ret["div_sentence_characters"] = df_ret["total_sentence"] / df_ret["total_characters"]
+            df_ret["div_sentence_words"] = df_ret["total_sentence"] / df_ret["total_words"]
+            df_ret["div_characters_words"] = df_ret["total_characters"] / df_ret["total_words"]
+            df_ret["div_words_unique_words"] = df_ret["total_words"] / df_ret["total_unique_words"]
+
+            for i, word in enumerate(["!", "?", "(", ")", "'", '"', ";", ".", ","]):
+                df_ret[f"count_word_special_{i}"] = [x.count(word) for x in excerpt]
+
+            return df_ret.fillna(0)
+
         df = pd.read_csv("input/commonlitreadabilityprize/train_folds.csv")
         if self.cfg.debug:
             df = df.iloc[::30]
 
+        df = feature_engineering(df)
+        self.cfg.feature_columns = [x for x in df.columns if x not in ["id", "excerpt", "target", "kfold", "standard_error"]]
+        self.cfg.feature_mean = df[self.cfg.feature_columns].mean().values
+        self.cfg.feature_std = df[self.cfg.feature_columns].std().values
         self.df_train = df[df["kfold"] != self.cfg.fold].reset_index(drop=True)
         self.df_val = df[df["kfold"] == self.cfg.fold].reset_index(drop=True)
 
@@ -810,6 +864,7 @@ class CommonLitModule(LightningModule):
                                                  (self.df_train["target"] < cfg.augmantation_range[1])]])
         self.dataset_train = CommonLitDataset(df=self.df_train,
                                               tokenizer=self.tokenizer,
+
                                               cfg=self.cfg)
         self.dataset_val = CommonLitDataset(df=self.df_val,
                                             tokenizer=self.tokenizer,
@@ -818,39 +873,16 @@ class CommonLitModule(LightningModule):
     def configure_optimizers(self):
         def extract_params(named_parameters, lr, weight_decay, no_decay=False):
             ret = {}
-            no_decay_ary = ["bias", "LayerNorm.weight"]
+            no_decay_ary = ["bias", "LayerNorm.weight", "pooler"]
 
             if no_decay:
                 ret["params"] = [p for n, p in named_parameters if not any(nd in n for nd in no_decay_ary)]
                 ret["weight_decay"] = 0
             else:
-                ret["params"] = [p for n, p in named_parameters if any(nd in n for nd in no_decay_ary)]
+                ret["params"] = [p for n, p in named_parameters if any(nd in n for nd in no_decay_ary) and "pooler" not in n]
                 ret["weight_decay"] = weight_decay
             ret["lr"] = lr
             return ret
-
-        def bert_params():
-            params = []
-            no_decay_ary = ["bias", "LayerNorm.weight"]
-            layers = self.bert.config.num_hidden_layers
-            for i in range(layers):
-                # models
-                # parameters
-                ret = {}
-                ret["params"] = [p for n, p in self.bert.named_parameters()
-                                 if f"encoder.layer.{i}." in n and not any(nd in n for nd in no_decay_ary)]
-                ret["weight_decay"] = self.cfg.weight_decay
-                ret["lr"] = self.cfg.lr_bert * (self.cfg.lr_bert_decay ** (layers - i + 1))
-                params.append(ret)
-
-                ret = {}
-                ret["params"] = [p for n, p in self.bert.named_parameters()
-                                 if f"bert.encoder.layer.{i}." in n and any(nd in n for nd in no_decay_ary)]
-                ret["weight_decay"] = 0
-                ret["lr"] = self.cfg.lr_bert * (self.cfg.lr_bert_decay ** (layers - i + 1))
-                params.append(ret)
-            return params
-
 
         params = []
         if self.cfg.prep_enable:
@@ -866,7 +898,8 @@ class CommonLitModule(LightningModule):
                 params.append({"params": self.bert.cls.parameters(), "weight_decay": self.cfg.weight_decay, "lr": self.cfg.lr_bert})
             else:
                 raise ValueError("mask用のparameterありません")
-        params.extend(bert_params())
+        params.append(extract_params(self.bert.named_parameters(), lr=self.cfg.lr_bert, weight_decay=self.cfg.weight_decay, no_decay=False))
+        params.append(extract_params(self.bert.named_parameters(), lr=self.cfg.lr_bert, weight_decay=0, no_decay=True))
         if self.cfg.prep_enable:
             params.append(extract_params(self.linear1.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
             params.append(extract_params(self.linear1.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
@@ -910,6 +943,9 @@ class CommonLitModule(LightningModule):
         if self.cfg.pooler_enable:
             params.append(extract_params(self.bert.pooler.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
             params.append(extract_params(self.bert.pooler.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
+        if self.cfg.feature_enable:
+            params.append(extract_params(self.linear_feature.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
+            params.append(extract_params(self.linear_feature.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
 
         optimizer = self.cfg.optimizer(params)
         num_warmup_steps = int(self.cfg.epochs_max * len(self.df_train) / self.cfg.batch_size * self.cfg.warmup_ratio)
@@ -937,11 +973,13 @@ def main(cfg_original: Config,
         mlflow.pytorch.autolog(log_models=False)
         for key, value in cfg_original.__dict__.items():
             mlflow.log_param(key, value)
-        with open(f"{output_dir}/cfg.pickle", "wb") as f:
-            pickle.dump(cfg_original, f)
         for fold in folds:
             try:
                 cfg = copy.copy(cfg_original)
+                if "deberta" in cfg.nlp_model_name:
+                    cfg.pooler_enable = False
+                    cfg.reinit_pooler = False
+                    cfg.hidden_stack_enable = True
                 cfg.fold = fold
                 checkpoint_callback = ModelCheckpoint(
                     monitor='val_loss',
@@ -958,6 +996,7 @@ def main(cfg_original: Config,
                                   precision=16,
                                   # amp_level="02",
                                   max_epochs=cfg.epochs,
+                                  auto_scale_batch_size=True,
                                   benchmark=True,
                                   val_check_interval=0.05,
                                   progress_bar_refresh_rate=1,
@@ -967,6 +1006,8 @@ def main(cfg_original: Config,
                                   callbacks=[checkpoint_callback])
 
                 trainer.fit(model)
+                with open(f"{output_dir}/cfg.pickle", "wb") as f:
+                    pickle.dump(cfg, f)
 
                 rmse += model.best_rmse
                 del trainer, model
@@ -974,6 +1015,7 @@ def main(cfg_original: Config,
                 torch.cuda.empty_cache()
             except Exception as e:
                 print(e)
+                # raise
         mlflow.log_metric("rmse_mean", rmse / len(folds))
 
 
@@ -987,23 +1029,24 @@ def config_large(cfg: Config, nlp_model_name: str):
 
 
 if __name__ == "__main__":
-    experiment_name = "roberta-base crossentropy / KLDivLoss"
+    experiment_name = "rodeberta-large tune"
     folds = [0, 1, 2, 3, 4]
 
-    # baseline
-    for crossentropy_range in [(-6, 4), (-5, 3)]:
-        cfg = Config(experiment_name=experiment_name)
-        cfg.crossentropy = True
-        cfg.crossentropy_min = crossentropy_range[0]
-        cfg.crossentropy_max = crossentropy_range[1]
-        main(cfg, folds=folds)
-
-    cfg = Config(experiment_name=experiment_name)
-    cfg.kl_div_enable = True
-    main(cfg, folds=folds)
-
-    for dropout in [0, 0.1, 0.2, 0.5]:
-        cfg = Config(experiment_name=experiment_name)
-        cfg.dropout = dropout
-        main(cfg, folds=folds)
+    for nlp_model_name in ["studio-ousia/luke-large",
+                           "microsoft/deberta-large",
+                           "bert-large-cased",
+                           "roberta-large"]:
+        for lr_bert in [2e-5, 3e-5, 5e-5]:
+            cfg = Config(experiment_name=experiment_name)
+            cfg.simple_structure = True
+            cfg.nlp_model_name = nlp_model_name
+            cfg.gradient_clipping = 0.2
+            if "deberta" in nlp_model_name or "luke" in nlp_model_name:
+                cfg.batch_size = 16
+            else:
+                cfg.batch_size = 24
+            cfg.lr_fc = 5e-5
+            cfg.lr_bert = lr_bert
+            cfg.reinit_layers = 4
+            main(cfg, folds=folds)
 

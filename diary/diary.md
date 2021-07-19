@@ -484,6 +484,214 @@ lr_bert_decay = 0.95, lr_bert = 3e-5 -> CV: 0.482
 lr_bert_decay = 0.95, lr_bert = 5e-5 -> CV: 0.479
 lr_bert_decay = 0.9, lr_bert = 1e-5 -> CV: 0.513
 lr_bert_decay = 0.9, lr_bert = 3e-5 -> CV: 0.49
-lr_bert_decay = 0.9, lr_bert = 5e-5 -> CV: 0.4
+
+# 2021/7/4
+
+## exp142: hidden_stack
+dropout_stack = 0 -> CV: 0.48
+dropout_stack = 0.2 -> CV: 0.479
+dropout_stack = 0.5 -> CV: 0.483
+
+## exp143: lstm
+linear_final_dim = 64 -> CV: 0.481
+linear_final_dim = 128 -> CV: 0.479
+linear_final_dim = 256 -> CV: 0.479
+linear_final_dim = 512 -> CV: 0.476
+
+## exp144: vocab
+linear_vocab_dim = 8 -> CV: 0.477
+linear_vocab_dim = 16 -> CV: 0.478
+
+linear_final_dim = 32 -> CV: 0.478
+linear_final_dim = 128 -> CV: 0.478
+linear_final_dim = 256 -> CV: 0.479
+linear_final_dim = 512 -> CV: 0.477
+
+## exp149: fine-tune 2
+reinit_layers = 1
+  * gradient_clipping = 1 CV: 0.478
+  * gradient_clipping = 2 CV: 0.482
+reinit_layers = 2
+  * gradient_clipping = 0.2 CV: 0.482
+  * gradient_clipping = 0.5 CV: 0.481
+  * gradient_clipping = 1.0 CV: 0.479
+reinit_layers = 3
+  * gradient_clipping = 0.2 CV: 0.477
+  * gradient_clipping = 0.5 CV: 0.476
+  * gradient_clipping = 1.0 CV: 0.476
+reinit_layers = 4
+  * gradient_clipping = 0.2 CV: 0.479
+  * gradient_clipping = 0.5 CV: 0.475
+  * gradient_clipping = 1.0 CV: 0.475
+
+## exp147: self_attn_pooler
+ごみ
+
+## exp150: large batch_size
+bs = 64 / lr_bert = 3e-5 CV: 0.481
+bs = 64 / lr_bert = 5e-5 CV: 0.482
+bs = 128 / lr_bert = 3e-5 CV: 0.502
+bs = 128 / lr_bert = 5e-5 CV: 0.503
+
+## exp151: iroiro
+crossentropy (-6, 4) CV: 0.479
+crossentropy (-5, 3) CV: 0.477
+kl_div_enable=True CV: 0.491
+dropout
+* 0.0 CV: 0.48
+* 0.1 CV: 0.478
+* 0.2 CV: 0.48
+* 0.5 CV: 0.478
+
+## exp152: roberta-large tune(only fold-0)
+lr_bert 2e-5
+* bs 8: CV: 0.491
+* bs 16: CV: 0.478
+
+lr_bert 3e-5
+* bs 8: CV: 0.475 
+* bs 16: CV: 0.492
+
+lr_bert 5e-5
+* bs 8: CV: 0.515
+* bs 16: CV: 0.492
+
+## exp153: roberta-large / large batch_size
+* lr_bert 1e-5 CV: 0.499
+* lr_bert 2e-5 CV: 0.487
+* lr_bert 3e-5 CV: 0.488
+* lr_bert 4e-5 CV: 0.49
+* lr_bert 5e-5 CV: 0.493
+
+## exp154: feature eng(いっぱい)
+* CV: 0.490
+
+## exp160: No activation
+* CV: 0.480
+
+## exp155: feature eng(17)
+* linear_final_dim 32: 0.478
+* linear_final_dim 64: 0.475
+* linear_final_dim 128: 0.471
+* linear_final_dim 256: 0.476
+* linear_final_dim 512: 0.478
+
+## exp156: roberta-large (reinit-layers)
+* reinit_layers = 3 CV: 0.489
+* reinit_layers = 4 CV: 0.485
+* reinit_layers = 5 CV: 0.486
+* reinit_layers = 6 CV: 0.487
+* reinit_layers = 7 CV: 0.488
+* reinit_layers = 8 CV: 0.491
 
 
+## exp156: model-tune
+* bert-base-cased
+  * reinit_layers = 1 CV: 0.509
+  * reinit_layers = 2 CV: 0.502
+  * reinit_layers = 3 CV: 0.502
+  * reinit_layers = 4 CV: 0.505
+  * reinit_layers = 5 CV: 0.511
+  * reinit_layers = 6 CV: 0.512
+* luke-base
+  * reinit_layers = 1 CV: 0.48
+  * reinit_layers = 2 CV: 0.479
+  * reinit_layers = 3 CV: 0.478
+  * reinit_layers = 4 CV: 0.477
+  * reinit_layers = 5 CV: 0.48
+  * reinit_layers = 6 CV: 0.48
+  
+  
+## exp162: roberta-large tuning
+* gradient_clip
+  * 0.1 : 0.484
+  * 0.2 : 0.483
+  * 0.5 : 0.486
+  
+* lr_fc
+  * 1e-4: 0.487
+  * 3e-4: 0.487
+  * 5e-4: 0.485
+  * 1e-5: 0.484
+  * 3e-5: 0.483
+  * 5e-5: 0.482
+
+* warmup_ratio
+  * 0: 0.487
+  * 0.05: 0.486
+  * 1: 0.509 <- なにやってんねん
+
+* feature_enable
+  * True 0.479
+  
+
+## exp164: 
+roberta-large tuning
+
+* bert_lr in [2e-5, 4e-5, 5e-5]
+* dropout_bert
+* gradient_clip=0.2 / lr_fc = 0.2 / feature_enable=True
+
+## exp165
+* xlnet_base_cased
+  * reinit_layer
+    * 0: 0.499
+    * 1: 0.497
+    * 2: 0.499
+    * 3: 0.502
+    * 4: 0.507
+
+* distilbert-base-cased
+  * reinit_layer(only 0)
+    * 0: 0.503
+    * 1: 0.514
+    * 2: 0.516
+    * 3: 0.512
+    * 4: 0.540
+  
+* albert-v2-based
+  * base -> 0.516
+  
+  * lr_bert (only 0)
+    * 1e-5: 0.500
+    * 2e-5: 0.507
+    * 3e-5: 0.503
+    * 4e-5: 0.501
+    * 5e-5: 0.502
+  
+  * lr_fc
+    * 1e-4: 0.502
+    * 3e-4: 0.499
+    * 5e-4: 0.511
+    * 1e-5: 0.512
+    * 3e-5: 0.492
+    * 5e-5: 0.499
+  
+## exp166
+* bert-largeをfold0だけでいろいろ
+  * reinit_layer
+    * 0: 0.491
+    * 1: 0.498
+    * 2: 0.495
+    * 3: 0.490
+    * 4: 0.494
+  * lr_bert
+    * 1e-5: 0.498
+    * 2e-5: 0.495
+    * 3e-5: 0.494
+    * 4e-5: 0.496
+    * 5e-5: 0.5
+  * gradient_clip
+    * 0.1: 0.492
+    * 0.2: 0.485
+    * 0.5: 0.494
+  
+
+https://discuss.pytorch.org/t/how-to-avoid-memory-leak-when-training-multiple-models-sequentially/100315/5
+
+# 2021/7/15
+## exp180
+
+
+## exp180_2
+dropout = 0

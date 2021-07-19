@@ -235,7 +235,7 @@ class Config:
 
     # reinit
     reinit_pooler: bool = True
-    reinit_layers: int = 1
+    reinit_layers: int = 4
 
     # pooler
     pooler_enable: bool = True
@@ -256,7 +256,7 @@ class Config:
     crossentropy_max: int = 4
 
     accumulate_grad_batches: int = 1
-    gradient_clipping: int = 0.2
+    gradient_clipping: int = 0.5
 
     dropout_bert: float = 0
 
@@ -1006,7 +1006,7 @@ if __name__ == "__main__":
         cfg.simple_structure = simple_structure
         main(cfg, folds=folds)
     """
-    for linear_vocab_dim in [8, 32]:
+    for linear_vocab_dim in [8, 16]:
         cfg = Config(experiment_name=experiment_name)
         cfg.linear_vocab_enable = True
         cfg.linear_vocab_dim = linear_vocab_dim
