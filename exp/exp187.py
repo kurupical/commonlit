@@ -1074,7 +1074,6 @@ def main(cfg_original: Config,
                 torch.cuda.empty_cache()
             except Exception as e:
                 print(e)
-                raise
 
         mlflow.log_metric("rmse_mean", rmse / len(folds))
 

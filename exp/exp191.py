@@ -723,7 +723,7 @@ class CommonLitModule(LightningModule):
                 x_bert.append(xx)
             else:
                 if "funnel" in self.cfg.nlp_model_name:
-                    xx = torch.stack([self.dropout_bert_stack(xx) for xx in x[1][-3:]]).mean(dim=0)
+                    xx = torch.stack([self.dropout_bert_stack(xx) for xx in x[1][-3:]]).mean(dim=[0, 2])
                 else:
                     if "bart" in self.cfg.nlp_model_name and not cfg.bart_decoder_only:
                         xx = torch.stack([self.dropout_bert_stack(xx) for xx in x[1][-4:] + x[4][-4:]]).mean(dim=0)

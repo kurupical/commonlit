@@ -430,7 +430,7 @@ class CommonLitModule(LightningModule):
         if self.cfg.feature_enable:
             hidden_size += self.cfg.linear_final_dim
             self.linear_feature = nn.Sequential(
-                nn.Linear(20, self.cfg.linear_final_dim),
+                nn.Linear(17, self.cfg.linear_final_dim),
                 self.cfg.activation(),
                 nn.Dropout(self.cfg.dropout)
             )
@@ -730,7 +730,7 @@ class CommonLitModule(LightningModule):
                 x_bert.append(xx)
             else:
                 if "funnel" in self.cfg.nlp_model_name:
-                    xx = torch.stack([self.dropout_bert_stack(xx) for xx in x[1][-3:]]).mean(dim=0)
+                    xx = torch.stack([self.dropout_bert_stack(xx) for xx in x[1][-3:]]).mean(dim=[0, 2])
                 else:
                     if "bart" in self.cfg.nlp_model_name and not cfg.bart_decoder_only:
                         xx = torch.stack([self.dropout_bert_stack(xx) for xx in x[1][-4:] + x[4][-4:]]).mean(dim=0)
@@ -883,118 +883,7 @@ class CommonLitModule(LightningModule):
             for i, word in enumerate(["!", "?", "(", ")", "'", '"', ";", ".", ","]):
                 df_ret[f"count_word_special_{i}"] = [x.count(word) for x in excerpt]
 
-            difficult_words = [
-                'its', 'which', 'being', 'such', 'may', 'those', 'power',
-                'has', 'between', 'war', 'been', 'any', 'an', 'upon', 'present',
-                'form', 'or', 'by', 'known', 'certain', 'possible', 'thus',
-                'less', 'this', 'well', '1', 'however', 'given', 'order', 'either',
-                'than', 'should', 'action', 'latter', 'per', 'In', 'therefore',
-                'state', 'itself', 'Mr', 'against', 'same', 'most', 'Government',
-                'result', 'great', 'without', 'these', 'provided', 'as',
-                'material', 'light', 'iron', 'part', 'means', 'German', 'only',
-                'These', 'nature', 'greater', 'general', '2', 'within', '5',
-                'account', 'whose', 'life', 'character', 'obtained', 'distance',
-                'taken', 'generally', 'since', 'now', 'purpose', 'question', 'due',
-                'France', 'surface', 'former', 'natural', 'be', 'matter', 'above',
-                'method', '000', 'are', 'manner', 'England', 'system', 'subject',
-                'common', 'country', 'pressure', 'history', 'To', 'whole', 'human',
-                'case', 'consists', 'necessary', 'yet', '4', 'especially',
-                'results', 'below', 'perhaps', 'public', 'Germany', 'space', 'far',
-                'temperature', 'length', 'force', 'object', 'theory', 'e',
-                'formed', 'London', 'conditions', 'specific', 'sense', 'effect',
-                'from', 'term', 'century', 'including', 'methods', 'process',
-                'systems', 'political', '3', 'M', 'second', 'produced', 'is',
-                'observed', 'developed', 'both', 'ordinary', 'machine', 'French',
-                'nearly', 'quantity', 'The', 'current', '6', 'fixed', 'service',
-                'acid', 'high', 'men', 'age', 'application', 'weight',
-                'development', 'contains', 'entirely', 'during', 'hour', 'source',
-                'electric', 'vessel', 'other', 'position', 'points', 'required',
-                'thousand', 'becomes', 'construction', 'data', 'origin', 'each',
-                'number', 'least', 'peace', 'experiments', 'persons', 'at', 'Thus',
-                'used', 'arranged', 'regard', 'true', 'twenty', 'considered',
-                'cases', 'army', 'level', 'uses', 'suitable', 'vast', 'direct',
-                'fact', 'following', 'remained', 'charge', 'gas', 'purposes',
-                'hydrogen', 'success', 'modern', 'our', 'direction', 'sufficient',
-                'single', 'increased', 'end', 'amount', 'A', 'among',
-                'interesting', 'carried', 'presence', 'designed', 'must',
-                'difference', 'circumstances', 'steel', 'processes', 'first',
-                'solution', 'ancient', 'become', 'clear', 'having', 'heat', 'On',
-                'lower', 'influence', 'Europe', 'volume', 'English', 'require',
-                'military', 'addition', 'peculiar', '50', 'produce', '100',
-                'applied', 'Russia', 'works', 'policy', 'qualities', 'done',
-                'apparatus', 'more', 'point', 'published', 'solved', 'chemical',
-                'arrangement', 'increase', 'several', 'Paris', 'world', 'metal',
-                'own', 'condition', 'equal', 'view', 'containing', '40',
-                'composed', 'attempt', 'advanced', 'remarkable', 'employed',
-                'diameter', 'support', 'strength', 'operations', 'shown', 'stars',
-                'with', 'nations', 'physical', 'necessity', 'mass', 'forms',
-                'established', 'relations', 'absolute', 'energy', 'exist', 'law',
-                'powers', 'cent', 'European', 'pure', 'bodies', 'composition',
-                'face', 'producing', '8', 'square'
-            ]
-            difficult_columns = []
-            for word in difficult_words:
-                col_name = f"count_word_{word}"
-                df_ret[col_name] = [x.split(" ").count(word) for x in excerpt]
-                difficult_columns.append(col_name)
-
-            df_ret["difficult_count_sum"] = df_ret[difficult_columns].sum(axis=1)
-            df_ret = df_ret.drop(difficult_columns, axis=1)
-
-            easy_words = [
-                'fun', 'neck', 'round', 'named', 'answered', 'pulled', 'Soon',
-                'crying', 'straight', 'frightened', 'asleep', 'chair', 'walking',
-                'person', 'bird', 'Come', 'seemed', 'pick', 'papa', 'watch',
-                'cake', 'ride', 'fly', 'ate', 'safe', 'horse', 'dear', 'ways',
-                'everything', 'winter', 'kind', 'will', 'there', 'inside',
-                'garden', 'Suddenly', 'anything', 'noise', 'else', 'live',
-                'saying', 'if', 'who', 'Some', 'felt', 'parents', 'can', 'were',
-                'climbed', 'bit', 'dark', 'angry', 'Do', 'once', 'then',
-                'At', 'bright', 'eating', 'better', 'shouted', "couldn't", 'Have',
-                'window', 'cry', 'However', "It's", 'wait', 'woman', 'Mother',
-                'brain', 'along', 'red', 'watching', 'stay', 'white', 'cold',
-                'talking', 'over', 'Every', 'girls', 'tried', 'black', 'That',
-                'would', 'caught', 'hear', "Don't", 'today', 'flew', 'road',
-                'snow', 'was', 'decided', 'sit', 'baby', 'grass', 'lot',
-                'beautiful', 'stop', 'friend', 'long', 'catch', 'playing', 'After',
-                'ground', 'liked', 'learn', 'walk', 'Her', 'jumped', 'kept',
-                'tired', 'money', 'herself', 'afraid', 'run', 'try', 'near', 'And',
-                'loved', 'left', 'sure', 'trying', 'sister', 'many', 'getting',
-                'his', 'eyes', 'Just', 'night', 'sun', 'sad', 'room', 'enough',
-                'My', 'replied', 'fell', 'right', 'People', 'before', 'walked',
-                'knew', 'never', 'when', 'am', 'why', 'pretty', "can't", 'bed',
-                'keep', 'fast', 'nice', 'head', 'family', 'boys', 'child', 'gave',
-                'much', 'hungry', 'opened', 'mamma', 'poor', 'so', 'Sometimes',
-                'sat', 'gone', "didn't", 'birds', 'thing', 'stopped', 'them',
-                'Once', 'trees', 'young', 'time', 'thinking', 'Why', 'happy',
-                'warm', 'coming', 'had', 'We', 'sleep', 'let', 'animals', 'Yes',
-                'dog', 'people', 'door', 'next', "I'm", 'about', 'looking', 'Well',
-                'There', 'wanted', 'look', 'he', "don't", 'again', 'something',
-                'way', 'lived', 'girl', 'hard', 'play', 'stood', 'Now', 'tree',
-                'school', 'come', 'found', 'How', 'things', 'they', 'find',
-                'friends', 'father', 'make', 'I', 'like', 'started', 'off', 'take',
-                'heard', 'my', 'too', 'told', 'boy', 'morning', 'soon', 'going',
-                'him', 'children', 'cried', 'good', 'What', 'began', 'around',
-                'tell', 'old', 'food', 'very', 'Oh', 'house', 'what', 'up', 'ran',
-                'want', 'out', 'could', 'down', 'big', 'know', 'because', 'help',
-                'little', 'called', 'He', 'looked', 'took', 'how', 'You',
-                'eat', 'got', 'They', 'did', 'put', 'think', 'But', 'back', 'just',
-                'mother', 'thought', 'So', 'away', 'her', 'asked', 'your', 'day',
-                'When', 'do', 'saw', 'came', 'see', 'home', 'me', 'Then', 'she',
-                'go', 'you', 'get', 'She', 'said', 'went', 'One'
-            ]
-            easy_columns = []
-            for word in easy_words:
-                col_name = f"count_word_{word}"
-                df_ret[f"count_word_{word}"] = [x.count(word) for x in excerpt]
-                easy_columns.append(col_name)
-
-            df_ret["easy_count_sum"] = df_ret[easy_columns].sum(axis=1)
-            df_ret = df_ret.drop(easy_columns, axis=1)
-
-            df_ret["div_difficult_easy"] = df_ret["easy_count_sum"] / df_ret["difficult_count_sum"]
-
-            return df_ret.fillna(0.1)
+            return df_ret.fillna(0)
 
         df = pd.read_csv("input/commonlitreadabilityprize/train_folds.csv")
         if self.cfg.debug:
@@ -1221,7 +1110,7 @@ def config_large(cfg: Config, nlp_model_name: str):
 
 
 if __name__ == "__main__":
-    experiment_name = "funnel_large tune"
+    experiment_name = "electra-large-discriminator tune"
     folds = [0, 1, 2, 3, 4]
 
     def common_config(cfg) -> Config:
@@ -1232,14 +1121,21 @@ if __name__ == "__main__":
         cfg.feature_enable = True
         cfg.tcn_module_enable = False
         cfg.linear_vocab_enable = True
-
+        cfg.seed = 19900222
         cfg.rnn_module_num = 1
         cfg.simple_structure = False
-        cfg.batch_size = 20
+        cfg.batch_size = 12
+        cfg.epochs = 5
+        cfg.epochs_max = 5
         return cfg
 
-    for nlp_model_name in ["roberta-large"]:
-        cfg = Config(experiment_name=experiment_name)
-        cfg = common_config(cfg)
-        cfg.nlp_model_name = nlp_model_name
-        main(cfg, folds=folds)
+    for nlp_model_name in ["bert-large-cased",
+                           "bert-large-uncased"]:
+        for reinit_layers in [3, 4, 5]:
+            for lr_bert in [2e-5, 3e-5, 5e-5]:
+                cfg = Config(experiment_name=experiment_name)
+                cfg = common_config(cfg)
+                cfg.reinit_layers = reinit_layers
+                cfg.nlp_model_name = nlp_model_name
+                cfg.lr_bert = lr_bert
+                main(cfg, folds=folds)

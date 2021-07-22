@@ -1118,7 +1118,12 @@ if __name__ == "__main__":
         cfg.pooler_enable = False
         cfg.reinit_pooler = False
         cfg.hidden_stack_enable = True
+        cfg.self_attention_enable = False
         cfg.feature_enable = True
+        cfg.tcn_module_enable = False
+        cfg.linear_vocab_enable = True
+
+        cfg.rnn_module_num = 1
         cfg.simple_structure = False
         cfg.batch_size = 20
         return cfg
