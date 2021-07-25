@@ -238,6 +238,7 @@ class CommonLitModule(LightningModule):
         self.convnet = timm.create_model(self.cfg.cnn_model_name,
                                          pretrained=self.cfg.cnn_pretrained,
                                          num_classes=0)
+
         if "efficientnet" in self.cfg.cnn_model_name:
             self.convnet.conv_stem = nn.Conv2d(self.bert.config.num_hidden_layers*12, 32, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
         if "resnet" in self.cfg.cnn_model_name:

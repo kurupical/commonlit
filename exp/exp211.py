@@ -1129,8 +1129,9 @@ if __name__ == "__main__":
         cfg.epochs_max = 5
         return cfg
 
-    for nlp_model_name in ["bert-large-cased",
-                           "bert-large-uncased"]:
+    # for nlp_model_name in ["bert-large-cased",
+    #                        "bert-large-uncased"]:
+    for nlp_model_name in ["bert-large-uncased"]:
         for reinit_layers in [3, 4, 5]:
             for lr_bert in [2e-5, 3e-5, 5e-5]:
                 cfg = Config(experiment_name=experiment_name)

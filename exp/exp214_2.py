@@ -346,6 +346,16 @@ class CommonLitModule(LightningModule):
                     self.convnet = timm.create_model(self.cfg.cnn_model_name,
                                                      pretrained=self.cfg.cnn_pretrained,
                                                      num_classes=0)
+                    if "swin" in self.cfg.cnn_model_name:
+                        self.convnet.patch_embed.proj = nn.Conv2d(
+                            self.bert.config.num_hidden_layers * self.bert.config.num_attention_heads,
+                            96, kernel_size=(4, 4), stride=(4, 4)
+                        )
+                    if "vit" in self.cfg.cnn_model_name:
+                        self.convnet.patch_embed.proj = nn.Conv2d(
+                            self.bert.config.num_hidden_layers * self.bert.config.num_attention_heads,
+                            768, kernel_size=(32, 32), stride=(32, 32)
+                        )
                     if "efficientnet" in self.cfg.cnn_model_name:
                         self.convnet.conv_stem = nn.Conv2d(
                             self.bert.config.num_hidden_layers * self.bert.config.num_attention_heads,
@@ -1082,7 +1092,7 @@ def main(cfg_original: Config,
                     break
                 rmse += model.best_rmse
 
-                if cfg.nlp_model_name in ["roberta-large", "luke-large"]:
+                if cfg.nlp_model_name in ["roberta-large", "studio-ousia/luke-large"]:
                     if fold == 0 and rmse > 0.47:
                         break
                     if fold == 1 and rmse / 2 > 0.465:
@@ -1091,7 +1101,9 @@ def main(cfg_original: Config,
                         break
                     if fold == 3 and rmse / 4 > 0.474:
                         break
-                if cfg.nlp_model_name in ["google/electra-large-discriminator"]:
+                if cfg.nlp_model_name in ["google/electra-large-discriminator",
+                                          "studio-ousia/luke-base",
+                                          "roberta-base"]:
                     if fold == 0 and rmse > 0.47:
                         break
                     if fold == 1 and rmse / 2 > 0.465:
@@ -1122,26 +1134,26 @@ if __name__ == "__main__":
         cfg.pooler_enable = False
         cfg.reinit_pooler = False
         cfg.hidden_stack_enable = True
-        cfg.self_attention_enable = False
+        cfg.self_attention_enable = True
         cfg.feature_enable = True
         cfg.tcn_module_enable = False
         cfg.linear_vocab_enable = True
         cfg.seed = 19900222
         cfg.rnn_module_num = 1
         cfg.simple_structure = False
-        cfg.batch_size = 12
+        cfg.batch_size = 32
+        cfg.epochs = 6
+        cfg.epochs_max = 12
         return cfg
 
-    for nlp_model_name in ["google/electra-large-discriminator"]:
-
-        for lr_bert in [2e-4, 3e-4]:
-            for reinit_layers in [0, 2, 4]:
-                for gradient_clipping in [0.2, 0.5]:
-                    cfg = Config(experiment_name=experiment_name)
-                    cfg = common_config(cfg)
-                    cfg.reinit_layers = reinit_layers
-                    cfg.gradient_clipping = gradient_clipping
-                    cfg.lr_bert = lr_bert
-                    cfg.nlp_model_name = nlp_model_name
-                    main(cfg, folds=folds)
+    for nlp_model_name in ["studio-ousia/luke-base"]:
+        for cnn_model_name in ["efficientnet_b0",
+                               "resnet18d"]:
+            cfg = Config(experiment_name=experiment_name)
+            cfg.cnn_model_name = cnn_model_name
+            if "swin" in cnn_model_name or "vit" in cnn_model_name:
+                cfg.max_length = 224
+            cfg = common_config(cfg)
+            cfg.nlp_model_name = nlp_model_name
+            main(cfg, folds=folds)
 

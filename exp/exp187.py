@@ -1153,15 +1153,15 @@ if __name__ == "__main__":
             cfg.nlp_model_name = nlp_model_name
             cfg.rnn_module_shrink_ratio = rnn_module_shrink_ratio
             main(cfg, folds=folds)
-        """
 
         cfg = Config(experiment_name=experiment_name)
         cfg = common_config(cfg)
         cfg.nlp_model_name = nlp_model_name
         cfg.rnn_module = nn.GRU
         main(cfg, folds=folds)
+        """
 
-        for lr_bert in [1.5e-5, 2.5e-5, 3.5e-5]:
+        for lr_bert in [2.5e-5, 3.5e-5]:
             cfg = Config(experiment_name=experiment_name)
             cfg = common_config(cfg)
             cfg.nlp_model_name = nlp_model_name

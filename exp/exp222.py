@@ -7,7 +7,7 @@ import pandas as pd
 import dataclasses
 from transformers import AutoTokenizer, AutoModel, AutoModelForMaskedLM
 import pytorch_lightning as pl
-from transformers import AdamW, get_linear_schedule_with_warmup
+from transformers import AdamW, get_linear_schedule_with_warmup, get_cosine_with_hard_restarts_schedule_with_warmup
 from typing import Any
 import os
 import numpy as np
@@ -268,6 +268,9 @@ class Config:
     feature_enable: bool = False
     bart_decoder_only: bool = True
 
+    stochastic_weight_avg: bool = False
+    num_cycles: int = 1
+
 class Lambda(nn.Module):
     def __init__(self, func):
         super().__init__()
@@ -295,6 +298,8 @@ class CommonLitModule(LightningModule):
             else:
                 self.bert = AutoModel.from_pretrained(self.cfg.nlp_model_name)
         self.tokenizer = AutoTokenizer.from_pretrained(self.cfg.nlp_model_name)
+        if "gpt" in self.cfg.nlp_model_name:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
 
         # setting bert dropout
         for module in self.bert.modules():
@@ -346,6 +351,16 @@ class CommonLitModule(LightningModule):
                     self.convnet = timm.create_model(self.cfg.cnn_model_name,
                                                      pretrained=self.cfg.cnn_pretrained,
                                                      num_classes=0)
+                    if "swin" in self.cfg.cnn_model_name:
+                        self.convnet.patch_embed.proj = nn.Conv2d(
+                            self.bert.config.num_hidden_layers * self.bert.config.num_attention_heads,
+                            96, kernel_size=(4, 4), stride=(4, 4)
+                        )
+                    if "vit" in self.cfg.cnn_model_name:
+                        self.convnet.patch_embed.proj = nn.Conv2d(
+                            self.bert.config.num_hidden_layers * self.bert.config.num_attention_heads,
+                            768, kernel_size=(32, 32), stride=(32, 32)
+                        )
                     if "efficientnet" in self.cfg.cnn_model_name:
                         self.convnet.conv_stem = nn.Conv2d(
                             self.bert.config.num_hidden_layers * self.bert.config.num_attention_heads,
@@ -582,7 +597,10 @@ class CommonLitModule(LightningModule):
                 for layer in self.bert.encoder.layer[-self.cfg.reinit_layers:]:
                     for module in layer.modules():
                         self.bert._init_weights(module)
-
+            elif "gpt2" in self.cfg.nlp_model_name:
+                for layer in self.h[-self.cfg.reinit_layers:]:
+                    for module in layer.modules():
+                        self.bert._init_weights(module)
 
         """
         for layer in [self.linear1, self.linear2, self.linear1_std, self.linear2_std, self.linear_perp, self.linear_vocab,
@@ -988,6 +1006,11 @@ class CommonLitModule(LightningModule):
         num_warmup_steps = int(self.cfg.epochs_max * len(self.df_train) / self.cfg.batch_size * self.cfg.warmup_ratio)
         num_training_steps = int(self.cfg.epochs_max * len(self.df_train) / self.cfg.batch_size) * self.cfg.training_steps_ratio
 
+        if self.cfg.num_cycles > 1:
+            scheduler = get_cosine_with_hard_restarts_schedule_with_warmup(optimizer,
+                                                                           num_warmup_steps=num_warmup_steps,
+                                                                           num_training_steps=num_training_steps,
+                                                                           num_cycles=self.cfg.num_cycles)
         scheduler = get_linear_schedule_with_warmup(optimizer,
                                                     num_warmup_steps=num_warmup_steps,
                                                     num_training_steps=num_training_steps)
@@ -1071,6 +1094,7 @@ def main(cfg_original: Config,
                                   default_root_dir=output_dir,
                                   gradient_clip_val=cfg.gradient_clipping,
                                   accumulate_grad_batches=cfg.accumulate_grad_batches,
+                                  stochastic_weight_avg=cfg.stochastic_weight_avg,
                                   callbacks=[checkpoint_callback])
 
                 trainer.fit(model)
@@ -1082,7 +1106,7 @@ def main(cfg_original: Config,
                     break
                 rmse += model.best_rmse
 
-                if cfg.nlp_model_name in ["roberta-large", "luke-large"]:
+                if cfg.nlp_model_name in ["roberta-large", "studio-ousia/luke-large"]:
                     if fold == 0 and rmse > 0.47:
                         break
                     if fold == 1 and rmse / 2 > 0.465:
@@ -1115,33 +1139,25 @@ def config_large(cfg: Config, nlp_model_name: str):
 
 
 if __name__ == "__main__":
-    experiment_name = "electra-large-discriminator tune"
+    experiment_name = "gpt2-large"
     folds = [0, 1, 2, 3, 4]
 
     def common_config(cfg) -> Config:
         cfg.pooler_enable = False
         cfg.reinit_pooler = False
         cfg.hidden_stack_enable = True
-        cfg.self_attention_enable = False
-        cfg.feature_enable = True
-        cfg.tcn_module_enable = False
-        cfg.linear_vocab_enable = True
         cfg.seed = 19900222
-        cfg.rnn_module_num = 1
-        cfg.simple_structure = False
-        cfg.batch_size = 12
+        cfg.simple_structure = True
+        cfg.batch_size = 4
         return cfg
 
-    for nlp_model_name in ["google/electra-large-discriminator"]:
-
-        for lr_bert in [2e-4, 3e-4]:
-            for reinit_layers in [0, 2, 4]:
-                for gradient_clipping in [0.2, 0.5]:
-                    cfg = Config(experiment_name=experiment_name)
-                    cfg = common_config(cfg)
-                    cfg.reinit_layers = reinit_layers
-                    cfg.gradient_clipping = gradient_clipping
-                    cfg.lr_bert = lr_bert
-                    cfg.nlp_model_name = nlp_model_name
-                    main(cfg, folds=folds)
+    for nlp_model_name in ["gpt2-large"]:
+        for reinit_layers in [4]:
+            cfg = Config(experiment_name=experiment_name)
+            cfg = common_config(cfg)
+            cfg.epochs = 4
+            cfg.epochs_max = 4
+            cfg.reinit_layers = reinit_layers
+            cfg.nlp_model_name = nlp_model_name
+            main(cfg, folds=folds)
 

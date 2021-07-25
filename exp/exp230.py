@@ -5,7 +5,7 @@ from torch.nn import functional as F
 from pytorch_lightning.core.lightning import LightningModule
 import pandas as pd
 import dataclasses
-from transformers import AutoTokenizer, AutoModel, AutoModelForMaskedLM
+from transformers import AutoTokenizer, AutoModel, AutoModelForMaskedLM, T5EncoderModel, T5Tokenizer
 import pytorch_lightning as pl
 from transformers import AdamW, get_linear_schedule_with_warmup
 from typing import Any
@@ -266,7 +266,10 @@ class Config:
     dropout_bert: float = 0
 
     feature_enable: bool = False
-    bart_decoder_only: bool = True
+    decoder_only: bool = True
+
+    stochastic_weight_avg: bool = False
+    val_check_interval: float = 0.05
 
 class Lambda(nn.Module):
     def __init__(self, func):
@@ -293,8 +296,16 @@ class CommonLitModule(LightningModule):
             if self.cfg.fine_tuned_path is not None:
                 self.bert = AutoModel.from_pretrained(self.cfg.fine_tuned_path)
             else:
-                self.bert = AutoModel.from_pretrained(self.cfg.nlp_model_name)
-        self.tokenizer = AutoTokenizer.from_pretrained(self.cfg.nlp_model_name)
+                if "t5" in self.cfg.nlp_model_name:
+                    self.bert = T5EncoderModel.from_pretrained(self.cfg.nlp_model_name)
+                else:
+                    self.bert = AutoModel.from_pretrained(self.cfg.nlp_model_name)
+        if "t5" in self.cfg.nlp_model_name:
+            self.tokenizer = T5Tokenizer.from_pretrained(self.cfg.nlp_model_name)
+        else:
+            self.tokenizer = AutoTokenizer.from_pretrained(self.cfg.nlp_model_name)
+        if "gpt" in self.cfg.nlp_model_name:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
 
         # setting bert dropout
         for module in self.bert.modules():
@@ -346,6 +357,16 @@ class CommonLitModule(LightningModule):
                     self.convnet = timm.create_model(self.cfg.cnn_model_name,
                                                      pretrained=self.cfg.cnn_pretrained,
                                                      num_classes=0)
+                    if "swin" in self.cfg.cnn_model_name:
+                        self.convnet.patch_embed.proj = nn.Conv2d(
+                            self.bert.config.num_hidden_layers * self.bert.config.num_attention_heads,
+                            96, kernel_size=(4, 4), stride=(4, 4)
+                        )
+                    if "vit" in self.cfg.cnn_model_name:
+                        self.convnet.patch_embed.proj = nn.Conv2d(
+                            self.bert.config.num_hidden_layers * self.bert.config.num_attention_heads,
+                            768, kernel_size=(32, 32), stride=(32, 32)
+                        )
                     if "efficientnet" in self.cfg.cnn_model_name:
                         self.convnet.conv_stem = nn.Conv2d(
                             self.bert.config.num_hidden_layers * self.bert.config.num_attention_heads,
@@ -574,7 +595,7 @@ class CommonLitModule(LightningModule):
                 for layer in self.bert.decoder.layers[-self.cfg.reinit_layers:]:
                     for module in layer.modules():
                         self.bert._init_weights(module)
-                if not self.cfg.bart_decoder_only:
+                if not self.cfg.decoder_only:
                     for layer in self.bert.encoder.layers[-self.cfg.reinit_layers:]:
                         for module in layer.modules():
                             self.bert._init_weights(module)
@@ -582,7 +603,24 @@ class CommonLitModule(LightningModule):
                 for layer in self.bert.encoder.layer[-self.cfg.reinit_layers:]:
                     for module in layer.modules():
                         self.bert._init_weights(module)
+            elif "gpt2" in self.cfg.nlp_model_name:
+                for layer in self.bert.h[-self.cfg.reinit_layers:]:
+                    for module in layer.modules():
+                        self.bert._init_weights(module)
 
+            elif "gpt-neo" in self.cfg.nlp_model_name:
+                for layer in self.bert.h[-self.cfg.reinit_layers:]:
+                    for module in layer.modules():
+                        self.bert._init_weights(module)
+
+            elif "t5" in self.cfg.nlp_model_name:
+                for layer in self.bert.encoder.block[-self.cfg.reinit_layers:]:
+                    for module in layer.modules():
+                        self.bert._init_weights(module)
+                if not self.cfg.decoder_only:
+                    for layer in self.bert.decoder.block[-self.cfg.reinit_layers:]:
+                        for module in layer.modules():
+                            self.bert._init_weights(module)
 
         """
         for layer in [self.linear1, self.linear2, self.linear1_std, self.linear2_std, self.linear_perp, self.linear_vocab,
@@ -653,6 +691,8 @@ class CommonLitModule(LightningModule):
             elif "bart" in self.cfg.nlp_model_name:
                 x = [x[0], x[2], x[3], None, x[6]]  # x[2]: decoder hidden_states, x[3]: cross attention, x[6]: encoder hidden_states
             elif "electra" in self.cfg.nlp_model_name:
+                x = [x[0], x[1], x[2]]
+            elif "t5" in self.cfg.nlp_model_name:
                 x = [x[0], x[1], x[2]]
             else:
                 x = [x[0], x[2], x[3], x[1]]
@@ -732,7 +772,7 @@ class CommonLitModule(LightningModule):
                 if "funnel" in self.cfg.nlp_model_name:
                     xx = torch.stack([self.dropout_bert_stack(xx) for xx in x[1][-3:]]).mean(dim=[0, 2])
                 else:
-                    if "bart" in self.cfg.nlp_model_name and not cfg.bart_decoder_only:
+                    if "bart" in self.cfg.nlp_model_name and not cfg.decoder_only:
                         xx = torch.stack([self.dropout_bert_stack(xx) for xx in x[1][-4:] + x[4][-4:]]).mean(dim=0)
                     else:
                         xx = torch.stack([self.dropout_bert_stack(xx) for xx in x[1][-4:]]).mean(dim=0)
@@ -1061,16 +1101,17 @@ def main(cfg_original: Config,
                 model = CommonLitModule(cfg=cfg,
                                         output_dir=output_dir)
                 trainer = Trainer(gpus=1,
-                                  precision=16,
+                                  # precision=16,
                                   auto_scale_batch_size=True,
                                   # amp_level="02",
                                   max_epochs=cfg.epochs,
                                   benchmark=True,
-                                  val_check_interval=0.05,
+                                  val_check_interval=cfg.val_check_interval,
                                   progress_bar_refresh_rate=1,
                                   default_root_dir=output_dir,
                                   gradient_clip_val=cfg.gradient_clipping,
                                   accumulate_grad_batches=cfg.accumulate_grad_batches,
+                                  stochastic_weight_avg=cfg.stochastic_weight_avg,
                                   callbacks=[checkpoint_callback])
 
                 trainer.fit(model)
@@ -1082,15 +1123,21 @@ def main(cfg_original: Config,
                     break
                 rmse += model.best_rmse
 
-                if cfg.nlp_model_name in ["roberta-large", "luke-large"]:
-                    if fold == 0 and rmse > 0.47:
-                        break
-                    if fold == 1 and rmse / 2 > 0.465:
-                        break
-                    if fold == 2 and rmse / 3 > 0.48:
-                        break
-                    if fold == 3 and rmse / 4 > 0.474:
-                        break
+                if cfg.nlp_model_name in ["roberta-large", "studio-ousia/luke-large"]:
+                    if cfg.epochs == 6:
+                        if fold == 0 and rmse > 0.47:
+                            break
+                        if fold == 1 and rmse / 2 > 0.465:
+                            break
+                        if fold == 2 and rmse / 3 > 0.48:
+                            break
+                        if fold == 3 and rmse / 4 > 0.474:
+                            break
+                    else:
+                        if fold == 0 and rmse > 0.47:
+                            break
+                        if fold == 1 and rmse / 2 > 0.465:
+                            break
                 if cfg.nlp_model_name in ["google/electra-large-discriminator"]:
                     if fold == 0 and rmse > 0.47:
                         break
@@ -1115,7 +1162,7 @@ def config_large(cfg: Config, nlp_model_name: str):
 
 
 if __name__ == "__main__":
-    experiment_name = "electra-large-discriminator tune"
+    experiment_name = "gpt-medium tune"
     folds = [0, 1, 2, 3, 4]
 
     def common_config(cfg) -> Config:
@@ -1125,23 +1172,25 @@ if __name__ == "__main__":
         cfg.self_attention_enable = False
         cfg.feature_enable = True
         cfg.tcn_module_enable = False
-        cfg.linear_vocab_enable = True
         cfg.seed = 19900222
-        cfg.rnn_module_num = 1
         cfg.simple_structure = False
         cfg.batch_size = 12
+        cfg.epochs = 4
+        cfg.epochs_max = 4
+        cfg.warmup_ratio = 0.05
         return cfg
 
-    for nlp_model_name in ["google/electra-large-discriminator"]:
+    for nlp_model_name in ["t5-large"]:
+        for lr_bert in [1e-5]:
+            cfg = Config(experiment_name=experiment_name)
+            cfg = common_config(cfg)
+            cfg.lr_bert = lr_bert
+            cfg.nlp_model_name = nlp_model_name
+            main(cfg, folds=folds)
 
-        for lr_bert in [2e-4, 3e-4]:
-            for reinit_layers in [0, 2, 4]:
-                for gradient_clipping in [0.2, 0.5]:
-                    cfg = Config(experiment_name=experiment_name)
-                    cfg = common_config(cfg)
-                    cfg.reinit_layers = reinit_layers
-                    cfg.gradient_clipping = gradient_clipping
-                    cfg.lr_bert = lr_bert
-                    cfg.nlp_model_name = nlp_model_name
-                    main(cfg, folds=folds)
-
+        for warmup_ratio in [0, 0.1]:
+            cfg = Config(experiment_name=experiment_name)
+            cfg = common_config(cfg)
+            cfg.warmup_ratio = warmup_ratio
+            cfg.nlp_model_name = nlp_model_name
+            main(cfg, folds=folds)

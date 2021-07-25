@@ -5,7 +5,7 @@ from torch.nn import functional as F
 from pytorch_lightning.core.lightning import LightningModule
 import pandas as pd
 import dataclasses
-from transformers import AutoTokenizer, AutoModel, AutoModelForMaskedLM
+from transformers import AutoTokenizer, AutoModel, AutoModelForMaskedLM, T5EncoderModel, T5Tokenizer
 import pytorch_lightning as pl
 from transformers import AdamW, get_linear_schedule_with_warmup
 from typing import Any
@@ -266,7 +266,12 @@ class Config:
     dropout_bert: float = 0
 
     feature_enable: bool = False
-    bart_decoder_only: bool = True
+    decoder_only: bool = True
+
+    stochastic_weight_avg: bool = False
+    val_check_interval: float = 0.05
+
+    attention_head_enable: bool = False
 
 class Lambda(nn.Module):
     def __init__(self, func):
@@ -275,6 +280,23 @@ class Lambda(nn.Module):
 
     def forward(self, x):
         return self.func(x)
+
+
+class AttentionHead(nn.Module):
+    def __init__(self, in_features, hidden_dim, num_targets):
+        super().__init__()
+        self.in_features = in_features
+
+        self.hidden_layer = nn.Linear(in_features, hidden_dim)
+        self.final_layer = nn.Linear(hidden_dim, num_targets)
+        self.out_features = hidden_dim
+
+    def forward(self, features):
+        att = torch.tanh(self.hidden_layer(features))
+        score = self.final_layer(att)
+        attention_weights = torch.softmax(score, dim=1)
+        return attention_weights
+
 
 class CommonLitModule(LightningModule):
     def __init__(self,
@@ -293,8 +315,16 @@ class CommonLitModule(LightningModule):
             if self.cfg.fine_tuned_path is not None:
                 self.bert = AutoModel.from_pretrained(self.cfg.fine_tuned_path)
             else:
-                self.bert = AutoModel.from_pretrained(self.cfg.nlp_model_name)
-        self.tokenizer = AutoTokenizer.from_pretrained(self.cfg.nlp_model_name)
+                if "t5" in self.cfg.nlp_model_name:
+                    self.bert = T5EncoderModel.from_pretrained(self.cfg.nlp_model_name)
+                else:
+                    self.bert = AutoModel.from_pretrained(self.cfg.nlp_model_name)
+        if "t5" in self.cfg.nlp_model_name:
+            self.tokenizer = T5Tokenizer.from_pretrained(self.cfg.nlp_model_name)
+        else:
+            self.tokenizer = AutoTokenizer.from_pretrained(self.cfg.nlp_model_name)
+        if "gpt" in self.cfg.nlp_model_name:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
 
         # setting bert dropout
         for module in self.bert.modules():
@@ -346,6 +376,16 @@ class CommonLitModule(LightningModule):
                     self.convnet = timm.create_model(self.cfg.cnn_model_name,
                                                      pretrained=self.cfg.cnn_pretrained,
                                                      num_classes=0)
+                    if "swin" in self.cfg.cnn_model_name:
+                        self.convnet.patch_embed.proj = nn.Conv2d(
+                            self.bert.config.num_hidden_layers * self.bert.config.num_attention_heads,
+                            96, kernel_size=(4, 4), stride=(4, 4)
+                        )
+                    if "vit" in self.cfg.cnn_model_name:
+                        self.convnet.patch_embed.proj = nn.Conv2d(
+                            self.bert.config.num_hidden_layers * self.bert.config.num_attention_heads,
+                            768, kernel_size=(32, 32), stride=(32, 32)
+                        )
                     if "efficientnet" in self.cfg.cnn_model_name:
                         self.convnet.conv_stem = nn.Conv2d(
                             self.bert.config.num_hidden_layers * self.bert.config.num_attention_heads,
@@ -364,6 +404,17 @@ class CommonLitModule(LightningModule):
         if self.cfg.hidden_stack_enable:
             hidden_size += self.cfg.linear_final_dim
             self.linear_hidden_final = nn.Sequential(
+                nn.Linear(self.bert.config.hidden_size, self.cfg.linear_final_dim),
+                # nn.BatchNorm1d(self.cfg.linear_final_dim),
+                self.cfg.activation(),
+                nn.Dropout(self.cfg.dropout)
+            )
+        if self.cfg.attention_head_enable:
+            hidden_size += self.cfg.linear_final_dim
+            self.attention_head = nn.Sequential(
+                AttentionHead(self.bert.config.hidden_size, self.bert.config.hidden_size, 1),
+            )
+            self.linear_attention_head_final = nn.Sequential(
                 nn.Linear(self.bert.config.hidden_size, self.cfg.linear_final_dim),
                 # nn.BatchNorm1d(self.cfg.linear_final_dim),
                 self.cfg.activation(),
@@ -574,7 +625,7 @@ class CommonLitModule(LightningModule):
                 for layer in self.bert.decoder.layers[-self.cfg.reinit_layers:]:
                     for module in layer.modules():
                         self.bert._init_weights(module)
-                if not self.cfg.bart_decoder_only:
+                if not self.cfg.decoder_only:
                     for layer in self.bert.encoder.layers[-self.cfg.reinit_layers:]:
                         for module in layer.modules():
                             self.bert._init_weights(module)
@@ -582,7 +633,24 @@ class CommonLitModule(LightningModule):
                 for layer in self.bert.encoder.layer[-self.cfg.reinit_layers:]:
                     for module in layer.modules():
                         self.bert._init_weights(module)
+            elif "gpt2" in self.cfg.nlp_model_name:
+                for layer in self.bert.h[-self.cfg.reinit_layers:]:
+                    for module in layer.modules():
+                        self.bert._init_weights(module)
 
+            elif "gpt-neo" in self.cfg.nlp_model_name:
+                for layer in self.bert.h[-self.cfg.reinit_layers:]:
+                    for module in layer.modules():
+                        self.bert._init_weights(module)
+
+            elif "t5" in self.cfg.nlp_model_name:
+                for layer in self.bert.encoder.block[-self.cfg.reinit_layers:]:
+                    for module in layer.modules():
+                        self.bert._init_weights(module)
+                if not self.cfg.decoder_only:
+                    for layer in self.bert.decoder.block[-self.cfg.reinit_layers:]:
+                        for module in layer.modules():
+                            self.bert._init_weights(module)
 
         """
         for layer in [self.linear1, self.linear2, self.linear1_std, self.linear2_std, self.linear_perp, self.linear_vocab,
@@ -653,6 +721,8 @@ class CommonLitModule(LightningModule):
             elif "bart" in self.cfg.nlp_model_name:
                 x = [x[0], x[2], x[3], None, x[6]]  # x[2]: decoder hidden_states, x[3]: cross attention, x[6]: encoder hidden_states
             elif "electra" in self.cfg.nlp_model_name:
+                x = [x[0], x[1], x[2]]
+            elif "t5" in self.cfg.nlp_model_name:
                 x = [x[0], x[1], x[2]]
             else:
                 x = [x[0], x[2], x[3], x[1]]
@@ -732,7 +802,7 @@ class CommonLitModule(LightningModule):
                 if "funnel" in self.cfg.nlp_model_name:
                     xx = torch.stack([self.dropout_bert_stack(xx) for xx in x[1][-3:]]).mean(dim=[0, 2])
                 else:
-                    if "bart" in self.cfg.nlp_model_name and not cfg.bart_decoder_only:
+                    if "bart" in self.cfg.nlp_model_name and not cfg.decoder_only:
                         xx = torch.stack([self.dropout_bert_stack(xx) for xx in x[1][-4:] + x[4][-4:]]).mean(dim=0)
                     else:
                         xx = torch.stack([self.dropout_bert_stack(xx) for xx in x[1][-4:]]).mean(dim=0)
@@ -751,6 +821,11 @@ class CommonLitModule(LightningModule):
                 x_lstm = self.lstm(torch.cat([x[1][idx] for idx in self.cfg.rnn_hidden_indice], dim=2)).mean(dim=1)
             x_lstm = self.linear_lstm_final(x_lstm)
             x_bert.append(x_lstm)
+        if self.cfg.attention_head_enable:
+            weights_attn = self.attention_head(x[0])
+            x_attn = torch.sum(weights_attn * x[0], dim=1)
+            x_attn = self.linear_attention_head_final(x_attn)
+            x_bert.append(x_attn)
         if self.cfg.tcn_module_enable:
             if self.cfg.word_axis:
                 x_tcn = self.tcn(self.dropout(x[0])).mean(dim=1)
@@ -976,7 +1051,11 @@ class CommonLitModule(LightningModule):
             params.append(extract_params(self.linear1_std.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
             params.append(extract_params(self.linear2_std.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
             params.append(extract_params(self.linear2_std.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
-
+        if self.cfg.attention_head_enable:
+            params.append(extract_params(self.attention_head.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
+            params.append(extract_params(self.attention_head.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
+            params.append(extract_params(self.linear_attention_head_final.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
+            params.append(extract_params(self.linear_attention_head_final.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
         if self.cfg.pooler_enable:
             params.append(extract_params(self.bert.pooler.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
             params.append(extract_params(self.bert.pooler.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
@@ -1061,16 +1140,17 @@ def main(cfg_original: Config,
                 model = CommonLitModule(cfg=cfg,
                                         output_dir=output_dir)
                 trainer = Trainer(gpus=1,
-                                  precision=16,
+                                  # precision=16,
                                   auto_scale_batch_size=True,
                                   # amp_level="02",
                                   max_epochs=cfg.epochs,
                                   benchmark=True,
-                                  val_check_interval=0.05,
+                                  val_check_interval=cfg.val_check_interval,
                                   progress_bar_refresh_rate=1,
                                   default_root_dir=output_dir,
                                   gradient_clip_val=cfg.gradient_clipping,
                                   accumulate_grad_batches=cfg.accumulate_grad_batches,
+                                  stochastic_weight_avg=cfg.stochastic_weight_avg,
                                   callbacks=[checkpoint_callback])
 
                 trainer.fit(model)
@@ -1082,19 +1162,14 @@ def main(cfg_original: Config,
                     break
                 rmse += model.best_rmse
 
-                if cfg.nlp_model_name in ["roberta-large", "luke-large"]:
+                if cfg.nlp_model_name in ["roberta-large",
+                                          "studio-ousia/luke-large",
+                                          "google/electra-large-discriminator"]:
                     if fold == 0 and rmse > 0.47:
                         break
                     if fold == 1 and rmse / 2 > 0.465:
                         break
-                    if fold == 2 and rmse / 3 > 0.48:
-                        break
-                    if fold == 3 and rmse / 4 > 0.474:
-                        break
-                if cfg.nlp_model_name in ["google/electra-large-discriminator"]:
-                    if fold == 0 and rmse > 0.47:
-                        break
-                    if fold == 1 and rmse / 2 > 0.465:
+                    if fold == 2 and rmse / 3 > 0.482:
                         break
                 del trainer, model, checkpoint_callback
                 gc.collect()
@@ -1115,7 +1190,7 @@ def config_large(cfg: Config, nlp_model_name: str):
 
 
 if __name__ == "__main__":
-    experiment_name = "electra-large-discriminator tune"
+    experiment_name = "funnel tune"
     folds = [0, 1, 2, 3, 4]
 
     def common_config(cfg) -> Config:
@@ -1126,22 +1201,31 @@ if __name__ == "__main__":
         cfg.feature_enable = True
         cfg.tcn_module_enable = False
         cfg.linear_vocab_enable = True
-        cfg.seed = 19900222
+        cfg.seed = 19920224
         cfg.rnn_module_num = 1
         cfg.simple_structure = False
         cfg.batch_size = 12
+        cfg.epochs = 4
+        cfg.epochs_max = 4
+        cfg.warmup_ratio = 0.05
+        if cfg.nlp_model_name == "gpt2-medium":
+            cfg.reinit_layers = 6
+        if cfg.nlp_model_name == "gpt2":
+            cfg.batch_size = 32
+        if cfg.nlp_model_name == "funnel-transformer/large":
+            cfg.linear_vocab_enable = False
+            cfg.rnn_module_num = 0
+            cfg.batch_size = 20
+            cfg.reinit_layers = 4
         return cfg
 
-    for nlp_model_name in ["google/electra-large-discriminator"]:
-
-        for lr_bert in [2e-4, 3e-4]:
-            for reinit_layers in [0, 2, 4]:
-                for gradient_clipping in [0.2, 0.5]:
-                    cfg = Config(experiment_name=experiment_name)
-                    cfg = common_config(cfg)
-                    cfg.reinit_layers = reinit_layers
-                    cfg.gradient_clipping = gradient_clipping
-                    cfg.lr_bert = lr_bert
-                    cfg.nlp_model_name = nlp_model_name
-                    main(cfg, folds=folds)
-
+    for nlp_model_name in ["funnel-transformer/large",
+                           "funnel-transformer/large-base"]:
+        for reinit_layers in [2, 4, 6]:
+            for lr_bert in [2e-5, 3e-5, 4e-5]:
+                cfg = Config(experiment_name=experiment_name)
+                cfg.nlp_model_name = nlp_model_name
+                cfg = common_config(cfg)
+                cfg.reinit_layers = reinit_layers
+                cfg.lr_bert = lr_bert
+                main(cfg, folds=folds)

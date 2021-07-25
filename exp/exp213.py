@@ -1116,20 +1116,18 @@ if __name__ == "__main__":
     def common_config(cfg) -> Config:
         cfg.pooler_enable = False
         cfg.reinit_pooler = False
-        cfg.hidden_stack_enable = True
         cfg.self_attention_enable = False
         cfg.feature_enable = True
         cfg.tcn_module_enable = False
-        cfg.linear_vocab_enable = True
         cfg.seed = 19900222
-        cfg.rnn_module_num = 1
-        cfg.simple_structure = False
-        cfg.batch_size = 12
+        cfg.simple_structure = True
+        cfg.batch_size = 24
         return cfg
 
     for nlp_model_name in ["albert-large-v2"]:
         cfg = Config(experiment_name=experiment_name)
         cfg = common_config(cfg)
         cfg.reinit_layers = 0
+        cfg.rnn_hidden_indice = (-1)
         cfg.nlp_model_name = nlp_model_name
         main(cfg, folds=folds)

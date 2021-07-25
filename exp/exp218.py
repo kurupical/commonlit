@@ -295,6 +295,8 @@ class CommonLitModule(LightningModule):
             else:
                 self.bert = AutoModel.from_pretrained(self.cfg.nlp_model_name)
         self.tokenizer = AutoTokenizer.from_pretrained(self.cfg.nlp_model_name)
+        if "gpt" in self.cfg.nlp_model_name:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
 
         # setting bert dropout
         for module in self.bert.modules():
@@ -346,6 +348,16 @@ class CommonLitModule(LightningModule):
                     self.convnet = timm.create_model(self.cfg.cnn_model_name,
                                                      pretrained=self.cfg.cnn_pretrained,
                                                      num_classes=0)
+                    if "swin" in self.cfg.cnn_model_name:
+                        self.convnet.patch_embed.proj = nn.Conv2d(
+                            self.bert.config.num_hidden_layers * self.bert.config.num_attention_heads,
+                            96, kernel_size=(4, 4), stride=(4, 4)
+                        )
+                    if "vit" in self.cfg.cnn_model_name:
+                        self.convnet.patch_embed.proj = nn.Conv2d(
+                            self.bert.config.num_hidden_layers * self.bert.config.num_attention_heads,
+                            768, kernel_size=(32, 32), stride=(32, 32)
+                        )
                     if "efficientnet" in self.cfg.cnn_model_name:
                         self.convnet.conv_stem = nn.Conv2d(
                             self.bert.config.num_hidden_layers * self.bert.config.num_attention_heads,
@@ -582,7 +594,10 @@ class CommonLitModule(LightningModule):
                 for layer in self.bert.encoder.layer[-self.cfg.reinit_layers:]:
                     for module in layer.modules():
                         self.bert._init_weights(module)
-
+            elif "gpt2" in self.cfg.nlp_model_name:
+                for layer in self.h[-self.cfg.reinit_layers:]:
+                    for module in layer.modules():
+                        self.bert._init_weights(module)
 
         """
         for layer in [self.linear1, self.linear2, self.linear1_std, self.linear2_std, self.linear_perp, self.linear_vocab,
@@ -915,9 +930,11 @@ class CommonLitModule(LightningModule):
             if no_decay:
                 ret["params"] = [p for n, p in named_parameters if not any(nd in n for nd in no_decay_ary)]
                 ret["weight_decay"] = 0
+                ret["beta"] = (0.5, 0.999)
             else:
                 ret["params"] = [p for n, p in named_parameters if any(nd in n for nd in no_decay_ary) and "pooler" not in n]
                 ret["weight_decay"] = weight_decay
+                ret["beta"] = (0.5, 0.999)
             ret["lr"] = lr
             return ret
 
@@ -1082,7 +1099,7 @@ def main(cfg_original: Config,
                     break
                 rmse += model.best_rmse
 
-                if cfg.nlp_model_name in ["roberta-large", "luke-large"]:
+                if cfg.nlp_model_name in ["roberta-large", "studio-ousia/luke-large"]:
                     if fold == 0 and rmse > 0.47:
                         break
                     if fold == 1 and rmse / 2 > 0.465:
@@ -1132,16 +1149,9 @@ if __name__ == "__main__":
         cfg.batch_size = 12
         return cfg
 
-    for nlp_model_name in ["google/electra-large-discriminator"]:
-
-        for lr_bert in [2e-4, 3e-4]:
-            for reinit_layers in [0, 2, 4]:
-                for gradient_clipping in [0.2, 0.5]:
-                    cfg = Config(experiment_name=experiment_name)
-                    cfg = common_config(cfg)
-                    cfg.reinit_layers = reinit_layers
-                    cfg.gradient_clipping = gradient_clipping
-                    cfg.lr_bert = lr_bert
-                    cfg.nlp_model_name = nlp_model_name
-                    main(cfg, folds=folds)
+    for nlp_model_name in ["roberta-large"]:
+        cfg = Config(experiment_name=experiment_name)
+        cfg = common_config(cfg)
+        cfg.nlp_model_name = nlp_model_name
+        main(cfg, folds=folds)
 
