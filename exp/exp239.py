@@ -1140,7 +1140,7 @@ def main(cfg_original: Config,
                 model = CommonLitModule(cfg=cfg,
                                         output_dir=output_dir)
                 trainer = Trainer(gpus=1,
-                                  # precision=16,
+                                  precision=16,
                                   auto_scale_batch_size=True,
                                   # amp_level="02",
                                   max_epochs=cfg.epochs,
@@ -1218,8 +1218,7 @@ if __name__ == "__main__":
         cfg = Config(experiment_name=experiment_name)
         cfg.nlp_model_name = nlp_model_name
         cfg = common_config(cfg)
-        cfg.linear_vocab_enable = False
-        cfg.rnn_module_num = 0
-        cfg.batch_size = 20
+        cfg.epochs = 6
+        cfg.epochs_max = 6
         main(cfg, folds=folds)
 

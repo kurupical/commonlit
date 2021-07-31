@@ -1,3 +1,4 @@
 cd ..
-python exp/exp239.py
-python exp/exp238.py
+python exp/exp281.py
+python exp/exp282.py
+python exp/exp278.py

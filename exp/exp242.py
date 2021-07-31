@@ -297,6 +297,7 @@ class AttentionHead(nn.Module):
         attention_weights = torch.softmax(score, dim=1)
         return attention_weights
 
+
 class CommonLitModule(LightningModule):
     def __init__(self,
                  cfg: Config,
@@ -335,64 +336,60 @@ class CommonLitModule(LightningModule):
         # network cfg
         hidden_size = 0
         if self.cfg.linear_vocab_enable:
-            if "funnel" in self.cfg.nlp_model_name:
-                print("funnelはlinear_vocab_enable無効です")
-                self.cfg.linear_vocab_enable = False
+            hidden_size += self.cfg.linear_final_dim
+            if self.cfg.nlp_model_name == "funnel-transformer/large-base":
+                input_size = self.bert.config.hidden_size / 2
             else:
-                hidden_size += self.cfg.linear_final_dim
-                self.linear_vocab = nn.Sequential(
-                    nn.Linear(self.bert.config.hidden_size, self.cfg.linear_vocab_dim_1),
-                    nn.Dropout(self.cfg.dropout),
-                    self.cfg.activation(),
-                    nn.Linear(self.cfg.linear_vocab_dim_1, self.cfg.linear_vocab_dim),
-                    nn.Dropout(self.cfg.dropout),
-                    self.cfg.activation()
-                )
-                self.linear_vocab_final = nn.Sequential(
-                    nn.Linear(self.cfg.linear_vocab_dim*self.cfg.max_length, self.cfg.linear_final_dim),
-                    # nn.BatchNorm1d(self.cfg.linear_final_dim),
-                    self.cfg.activation(),
-                    nn.Dropout(self.cfg.dropout)
-                )
+                input_size = self.bert.config.hidden_size
+            self.linear_vocab = nn.Sequential(
+                nn.Linear(input_size, self.cfg.linear_vocab_dim_1),
+                nn.Dropout(self.cfg.dropout),
+                self.cfg.activation(),
+                nn.Linear(self.cfg.linear_vocab_dim_1, self.cfg.linear_vocab_dim),
+                nn.Dropout(self.cfg.dropout),
+                self.cfg.activation()
+            )
+            self.linear_vocab_final = nn.Sequential(
+                nn.Linear(self.cfg.linear_vocab_dim*self.cfg.max_length, self.cfg.linear_final_dim),
+                # nn.BatchNorm1d(self.cfg.linear_final_dim),
+                self.cfg.activation(),
+                nn.Dropout(self.cfg.dropout)
+            )
         if self.cfg.self_attention_enable:
-            if "funnel" in self.cfg.nlp_model_name:
-                print("funnelはself_attention_enable無効です")
-                self.cfg.self_attention_enable = False
+            hidden_size += self.cfg.linear_final_dim
+            if self.cfg.cnn_model_name == "SimpleConv2D":
+                self.convnet = nn.Sequential(
+                    nn.Conv2d(self.bert.config.num_hidden_layers * self.bert.config.num_attention_heads,
+                              self.cfg.conv2d_hidden_channel, kernel_size=(1, 1), stride=(1, 1), bias=False),
+                    nn.ReLU(),
+                    nn.Conv2d(self.cfg.conv2d_hidden_channel,
+                              1, kernel_size=(1, 1), stride=(1, 1), bias=False),
+                    nn.ReLU(),
+                    Lambda(lambda x: x.view(x.size(0), -1)),
+                )
+                self.convnet.num_features = self.cfg.max_length ** 2
             else:
-                hidden_size += self.cfg.linear_final_dim
-                if self.cfg.cnn_model_name == "SimpleConv2D":
-                    self.convnet = nn.Sequential(
-                        nn.Conv2d(self.bert.config.num_hidden_layers * self.bert.config.num_attention_heads,
-                                  self.cfg.conv2d_hidden_channel, kernel_size=(1, 1), stride=(1, 1), bias=False),
-                        nn.ReLU(),
-                        nn.Conv2d(self.cfg.conv2d_hidden_channel,
-                                  1, kernel_size=(1, 1), stride=(1, 1), bias=False),
-                        nn.ReLU(),
-                        Lambda(lambda x: x.view(x.size(0), -1)),
+                self.convnet = timm.create_model(self.cfg.cnn_model_name,
+                                                 pretrained=self.cfg.cnn_pretrained,
+                                                 num_classes=0)
+                if "swin" in self.cfg.cnn_model_name:
+                    self.convnet.patch_embed.proj = nn.Conv2d(
+                        self.bert.config.num_hidden_layers * self.bert.config.num_attention_heads,
+                        96, kernel_size=(4, 4), stride=(4, 4)
                     )
-                    self.convnet.num_features = self.cfg.max_length ** 2
-                else:
-                    self.convnet = timm.create_model(self.cfg.cnn_model_name,
-                                                     pretrained=self.cfg.cnn_pretrained,
-                                                     num_classes=0)
-                    if "swin" in self.cfg.cnn_model_name:
-                        self.convnet.patch_embed.proj = nn.Conv2d(
-                            self.bert.config.num_hidden_layers * self.bert.config.num_attention_heads,
-                            96, kernel_size=(4, 4), stride=(4, 4)
-                        )
-                    if "vit" in self.cfg.cnn_model_name:
-                        self.convnet.patch_embed.proj = nn.Conv2d(
-                            self.bert.config.num_hidden_layers * self.bert.config.num_attention_heads,
-                            768, kernel_size=(32, 32), stride=(32, 32)
-                        )
-                    if "efficientnet" in self.cfg.cnn_model_name:
-                        self.convnet.conv_stem = nn.Conv2d(
-                            self.bert.config.num_hidden_layers * self.bert.config.num_attention_heads,
-                            32, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
-                    if "resnet" in self.cfg.cnn_model_name:
-                        self.convnet.conv1 = nn.Conv2d(
-                            self.bert.config.num_hidden_layers * self.bert.config.num_attention_heads,
-                            64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False)
+                if "vit" in self.cfg.cnn_model_name:
+                    self.convnet.patch_embed.proj = nn.Conv2d(
+                        self.bert.config.num_hidden_layers * self.bert.config.num_attention_heads,
+                        768, kernel_size=(32, 32), stride=(32, 32)
+                    )
+                if "efficientnet" in self.cfg.cnn_model_name:
+                    self.convnet.conv_stem = nn.Conv2d(
+                        self.bert.config.num_hidden_layers * self.bert.config.num_attention_heads,
+                        32, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
+                if "resnet" in self.cfg.cnn_model_name:
+                    self.convnet.conv1 = nn.Conv2d(
+                        self.bert.config.num_hidden_layers * self.bert.config.num_attention_heads,
+                        64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False)
 
             self.linear_conv_final = nn.Sequential(
                 nn.Linear(self.convnet.num_features, self.cfg.linear_final_dim),
@@ -420,34 +417,30 @@ class CommonLitModule(LightningModule):
                 nn.Dropout(self.cfg.dropout)
             )
         if self.cfg.rnn_module_num > 0:
-            if "funnel" in self.cfg.nlp_model_name:
-                print("funnelはrnn無効です")
-                self.cfg.rnn_module_num = 0
-            else:
-                hidden_size += self.cfg.linear_final_dim
-                self.lstm = self.make_lstm_module()
-                if self.cfg.bidirectional:
-                    if self.cfg.word_axis:
-                        lstm_size = int(self.cfg.max_length * len(self.cfg.rnn_hidden_indice) * (
-                                    (2 * self.cfg.rnn_module_shrink_ratio) ** self.cfg.rnn_module_num))
-                    else:
-                        lstm_size = int(self.bert.config.hidden_size * len(self.cfg.rnn_hidden_indice) * (
-                                    (2 * self.cfg.rnn_module_shrink_ratio) ** self.cfg.rnn_module_num))
+            hidden_size += self.cfg.linear_final_dim
+            self.lstm = self.make_lstm_module()
+            if self.cfg.bidirectional:
+                if self.cfg.word_axis:
+                    lstm_size = int(self.cfg.max_length * len(self.cfg.rnn_hidden_indice) * (
+                                (2 * self.cfg.rnn_module_shrink_ratio) ** self.cfg.rnn_module_num))
                 else:
-                    if self.cfg.word_axis:
-                        lstm_size = int(self.cfg.max_length * len(self.cfg.rnn_hidden_indice) * (
-                                    self.cfg.rnn_module_shrink_ratio ** self.cfg.rnn_module_num))
+                    lstm_size = int(self.bert.config.hidden_size * len(self.cfg.rnn_hidden_indice) * (
+                                (2 * self.cfg.rnn_module_shrink_ratio) ** self.cfg.rnn_module_num))
+            else:
+                if self.cfg.word_axis:
+                    lstm_size = int(self.cfg.max_length * len(self.cfg.rnn_hidden_indice) * (
+                                self.cfg.rnn_module_shrink_ratio ** self.cfg.rnn_module_num))
 
-                    else:
-                        lstm_size = int(self.bert.config.hidden_size * len(self.cfg.rnn_hidden_indice) * (
-                                    self.cfg.rnn_module_shrink_ratio ** self.cfg.rnn_module_num))
+                else:
+                    lstm_size = int(self.bert.config.hidden_size * len(self.cfg.rnn_hidden_indice) * (
+                                self.cfg.rnn_module_shrink_ratio ** self.cfg.rnn_module_num))
 
-                self.linear_lstm_final = nn.Sequential(
-                    nn.Linear(lstm_size, self.cfg.linear_final_dim),
-                    # nn.BatchNorm1d(self.cfg.linear_final_dim),
-                    self.cfg.activation(),
-                    nn.Dropout(self.cfg.dropout)
-                )
+            self.linear_lstm_final = nn.Sequential(
+                nn.Linear(lstm_size, self.cfg.linear_final_dim),
+                # nn.BatchNorm1d(self.cfg.linear_final_dim),
+                self.cfg.activation(),
+                nn.Dropout(self.cfg.dropout)
+            )
         if self.cfg.tcn_module_enable:
             hidden_size += self.cfg.linear_final_dim
             if self.cfg.word_axis:
@@ -1215,23 +1208,20 @@ if __name__ == "__main__":
             cfg.reinit_layers = 6
         if cfg.nlp_model_name == "gpt2":
             cfg.batch_size = 32
+        if cfg.nlp_model_name == "funnel-transformer/large-base":
+            cfg.epochs = 6
+            cfg.epochs_max = 6
+            cfg.linear_vocab_enable = False
+            cfg.rnn_module_num = 0
+            cfg.feature_enable = False
         if cfg.nlp_model_name == "funnel-transformer/large":
             cfg.epochs = 6
             cfg.epochs_max = 6
         return cfg
 
-    for nlp_model_name in ["funnel-transformer/large"]:
-        for reinit_layers in [4]:
-            for lr_bert in [3e-5]:
-                cfg = Config(experiment_name=experiment_name)
-                cfg.nlp_model_name = nlp_model_name
-                cfg = common_config(cfg)
-                cfg.reinit_layers = reinit_layers
-                cfg.lr_bert = lr_bert
-                main(cfg, folds=folds)
-
-        for reinit_layers in [6]:
-            for lr_bert in [2e-5, 3e-5]:
+    for nlp_model_name in ["google/electra-large-discriminator"]:
+        for reinit_layers in [2, 4, 6]:
+            for lr_bert in [2e-5, 3e-5, 4e-5]:
                 cfg = Config(experiment_name=experiment_name)
                 cfg.nlp_model_name = nlp_model_name
                 cfg = common_config(cfg)
