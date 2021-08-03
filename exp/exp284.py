@@ -1160,7 +1160,7 @@ def main(cfg_original: Config,
                     pickle.dump(cfg, f)
 
                 # 足切り1
-                if fold == 0 and model.best_rmse > 0.485:
+                if fold == 0 and model.best_rmse > 0.485 and cfg.nlp_model_name != "t5-large":
                     break
                 rmse += model.best_rmse
 
@@ -1307,6 +1307,10 @@ if __name__ == "__main__":
             cfg.multi_dropout_num = 1
             cfg.multi_dropout_ratio = 0
             cfg.rnn_hidden_indice = (-1, -2)
+        if cfg.nlp_model_name == "funnel-transformer/large":
+            cfg.epochs = 6
+            cfg.epochs_max = 6
+            cfg.lr_bert = 2e-5
         if cfg.nlp_model_name == "microsoft/deberta-xlarge":
             cfg.reinit_layers = 4
             cfg.lr_bert = 1e-5
@@ -1314,33 +1318,16 @@ if __name__ == "__main__":
             cfg.linear_vocab_enable = False
             cfg.epochs = 3
             cfg.epochs_max = 3
+        if cfg.nlp_model_name == "funnel-transformer/xlarge":
+            cfg.epochs = 6
+            cfg.epochs_max = 6
+            cfg.lr_bert = 2e-5
+            cfg.reinit_layers = 2
         return cfg
 
 
-    for nlp_model_name in ["t5-large"]:
-        for lr_bert in [15e-5]:
-            """
-            cfg = Config(experiment_name=experiment_name)
-            cfg.nlp_model_name = nlp_model_name
-            cfg = common_config(cfg)
-            cfg.rnn_module_num = 1
-            cfg.lr_bert = lr_bert
-            main(cfg, folds=folds)
-            for reinit_layers in [3, 6]:
-                cfg = Config(experiment_name=experiment_name)
-                cfg.nlp_model_name = nlp_model_name
-                cfg = common_config(cfg)
-                cfg.reinit_layers = reinit_layers
-                cfg.lr_bert = lr_bert
-                main(cfg, folds=folds)
-            """
-
-            for lr in [1e-3, 3e-3, 3e-4]:
-                cfg = Config(experiment_name=experiment_name)
-                cfg.nlp_model_name = nlp_model_name
-                cfg = common_config(cfg)
-                cfg.lr_bert = lr_bert
-                cfg.lr_fc = lr
-                cfg.lr_rnn = lr
-                cfg.lr_tcn = lr
-                main(cfg, folds=folds)
+    for nlp_model_name in ["funnel-transformer/xlarge"]:
+        cfg = Config(experiment_name=experiment_name)
+        cfg.nlp_model_name = nlp_model_name
+        cfg = common_config(cfg)
+        main(cfg, folds=folds)

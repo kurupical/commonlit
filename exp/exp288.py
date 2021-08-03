@@ -235,6 +235,7 @@ class Config:
     max_length: int = 256
 
     hidden_stack_enable: bool = False
+    hidden_stack_first_enable: bool = False
     prep_enable: bool = False
     kl_div_enable: bool = False
 
@@ -410,6 +411,14 @@ class CommonLitModule(LightningModule):
                 self.cfg.activation(),
                 nn.Dropout(self.cfg.dropout)
             )
+        if self.cfg.hidden_stack_first_enable:
+            hidden_size += self.cfg.linear_final_dim
+            self.linear_hidden_first_final = nn.Sequential(
+                nn.Linear(self.bert.config.hidden_size, self.cfg.linear_final_dim),
+                # nn.BatchNorm1d(self.cfg.linear_final_dim),
+                self.cfg.activation(),
+                nn.Dropout(self.cfg.dropout)
+            )
         if self.cfg.attention_head_enable:
             hidden_size += self.cfg.linear_final_dim
             self.attention_head = nn.Sequential(
@@ -561,7 +570,7 @@ class CommonLitModule(LightningModule):
             if "albert" in self.cfg.nlp_model_name:
                 raise ValueError("albertはreinitしちゃだめ")
 
-            elif "bert" in self.cfg.nlp_model_name or "roberta" in self.cfg.nlp_model_name:
+            elif "bert" in self.cfg.nlp_model_name or "roberta" in self.cfg.nlp_model_name or "ernie" in self.cfg.nlp_model_name:
                 if self.cfg.prep_enable:
                     if get_model_type(self.cfg.nlp_model_name) == "bert":
                         layers = self.bert.bert.encoder.layer[-self.cfg.reinit_layers:]
@@ -814,6 +823,21 @@ class CommonLitModule(LightningModule):
                     xx = xx / torch.sum(attention_mask, dim=-1, keepdim=True)
                 xx = self.linear_hidden_final(xx)
                 x_bert.append(xx)
+        if self.cfg.hidden_stack_first_enable:
+            if "albert" in self.cfg.nlp_model_name:
+                xx = self.linear_hidden_first_final(x[0].mean(dim=1))
+                x_bert.append(xx)
+            else:
+                if "funnel" in self.cfg.nlp_model_name:
+                    xx = torch.stack([self.dropout_bert_stack(xx) for xx in x[1][:3]]).mean(dim=[0, 2])
+                else:
+                    xx = torch.stack([self.dropout_bert_stack(xx) for xx in x[1][:4]]).mean(dim=0)
+                    xx = torch.sum(
+                        xx * attention_mask.unsqueeze(-1), dim=1, keepdim=False
+                    )
+                    xx = xx / torch.sum(attention_mask, dim=-1, keepdim=True)
+                xx = self.linear_hidden_first_final(xx)
+                x_bert.append(xx)
 
         # residual feature
         if self.cfg.rnn_module_num > 0:
@@ -1041,6 +1065,9 @@ class CommonLitModule(LightningModule):
         if self.cfg.hidden_stack_enable:
             params.append(extract_params(self.linear_hidden_final.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
             params.append(extract_params(self.linear_hidden_final.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
+        if self.cfg.hidden_stack_first_enable:
+            params.append(extract_params(self.linear_hidden_first_final.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
+            params.append(extract_params(self.linear_hidden_first_final.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
         if self.cfg.simple_structure:
             params.append(extract_params(self.linear_simple.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
             params.append(extract_params(self.linear_simple.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
@@ -1160,7 +1187,7 @@ def main(cfg_original: Config,
                     pickle.dump(cfg, f)
 
                 # 足切り1
-                if fold == 0 and model.best_rmse > 0.485:
+                if fold == 0 and model.best_rmse > 0.485 and cfg.nlp_model_name != "t5-large":
                     break
                 rmse += model.best_rmse
 
@@ -1210,6 +1237,12 @@ def main(cfg_original: Config,
                         break
                     if fold == 1 and rmse / 2 > 0.465:
                         break
+                if cfg.nlp_model_name in ["nghuyong/ernie-2.0-large-en"]:
+                    if fold == 0 and rmse > 0.457:
+                        break
+                    if fold == 1 and rmse / 2 > 0.457:
+                        break
+
                 del trainer, model, checkpoint_callback
                 gc.collect()
                 torch.cuda.empty_cache()
@@ -1236,6 +1269,7 @@ if __name__ == "__main__":
         cfg.pooler_enable = False
         cfg.reinit_pooler = False
         cfg.hidden_stack_enable = True
+        cfg.hidden_stack_first_enable = False
         cfg.self_attention_enable = False
         cfg.feature_enable = True
         cfg.tcn_module_enable = False
@@ -1256,11 +1290,11 @@ if __name__ == "__main__":
         if cfg.nlp_model_name == "gpt2-large":
             cfg.reinit_layers = 6
             cfg.lr_bert = 1e-5
-            cfg.hidden_stack_enable = False
             cfg.batch_size = 4
             cfg.linear_vocab_enable = False
             cfg.epochs = 3
             cfg.epochs_max = 3
+            cfg.gradient_clipping = 0.5
         if cfg.nlp_model_name == "gpt2":
             cfg.batch_size = 32
         if cfg.nlp_model_name == "funnel-transformer/large-base":
@@ -1278,6 +1312,9 @@ if __name__ == "__main__":
             cfg.weight_decay = 0
             cfg.epochs = 6
             cfg.epochs_max = 6
+            cfg.lr_fc = 3e-3
+            cfg.lr_rnn = 3e-3
+            cfg.lr_tcn = 3e-3
         if cfg.nlp_model_name == "t5-base":
             cfg.tcn_module_enable = False
             cfg.linear_vocab_enable = False
@@ -1307,6 +1344,10 @@ if __name__ == "__main__":
             cfg.multi_dropout_num = 1
             cfg.multi_dropout_ratio = 0
             cfg.rnn_hidden_indice = (-1, -2)
+        if cfg.nlp_model_name == "funnel-transformer/large":
+            cfg.epochs = 6
+            cfg.epochs_max = 6
+            cfg.lr_bert = 2e-5
         if cfg.nlp_model_name == "microsoft/deberta-xlarge":
             cfg.reinit_layers = 4
             cfg.lr_bert = 1e-5
@@ -1314,33 +1355,48 @@ if __name__ == "__main__":
             cfg.linear_vocab_enable = False
             cfg.epochs = 3
             cfg.epochs_max = 3
+        if cfg.nlp_model_name == "funnel-transformer/xlarge":
+            cfg.epochs = 6
+            cfg.epochs_max = 6
+            cfg.lr_bert = 2e-5
+            cfg.reinit_layers = 2
+        if cfg.nlp_model_name == "nghuyong/ernie-2.0-large-en":
+            cfg.reinit_layers = 2
+            cfg.lr_bert = 2e-5
+            # cfg.hidden_stack_first_enable = True
         return cfg
 
 
-    for nlp_model_name in ["t5-large"]:
-        for lr_bert in [15e-5]:
-            """
+    for nlp_model_name in ["nghuyong/ernie-2.0-large-en"]:
+        """
+        for reinit_layers in [1, 3]:
             cfg = Config(experiment_name=experiment_name)
             cfg.nlp_model_name = nlp_model_name
             cfg = common_config(cfg)
-            cfg.rnn_module_num = 1
+            cfg.reinit_layers = reinit_layers
+            main(cfg, folds=folds)
+
+        for lr_bert in [2e-5]:
+            cfg = Config(experiment_name=experiment_name)
+            cfg.nlp_model_name = nlp_model_name
+            cfg = common_config(cfg)
             cfg.lr_bert = lr_bert
             main(cfg, folds=folds)
-            for reinit_layers in [3, 6]:
-                cfg = Config(experiment_name=experiment_name)
-                cfg.nlp_model_name = nlp_model_name
-                cfg = common_config(cfg)
-                cfg.reinit_layers = reinit_layers
-                cfg.lr_bert = lr_bert
-                main(cfg, folds=folds)
-            """
+        cfg = Config(experiment_name=experiment_name)
+        cfg.nlp_model_name = nlp_model_name
+        cfg = common_config(cfg)
+        cfg.gradient_clipping = 0.5
+        main(cfg, folds=folds)
 
-            for lr in [1e-3, 3e-3, 3e-4]:
-                cfg = Config(experiment_name=experiment_name)
-                cfg.nlp_model_name = nlp_model_name
-                cfg = common_config(cfg)
-                cfg.lr_bert = lr_bert
-                cfg.lr_fc = lr
-                cfg.lr_rnn = lr
-                cfg.lr_tcn = lr
-                main(cfg, folds=folds)
+        cfg = Config(experiment_name=experiment_name)
+        cfg.nlp_model_name = nlp_model_name
+        cfg = common_config(cfg)
+        cfg.gradient_clipping = 0.1
+        main(cfg, folds=folds)
+        """
+
+        cfg = Config(experiment_name=experiment_name)
+        cfg.nlp_model_name = nlp_model_name
+        cfg = common_config(cfg)
+        cfg.rnn_hidden_indice = (-1, -2, 0, 1)
+        main(cfg, folds=folds)

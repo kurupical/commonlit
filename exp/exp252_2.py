@@ -216,7 +216,7 @@ class Config:
     tcn_module_num: int = 3
     tcn_module: nn.Module = TemporalConvNet
     tcn_module_kernel_size: int = 4
-    tcn_module_dropout: float = 0
+    tcn_module_dropout: float = 0.2
 
     linear_vocab_enable: bool = False
     augmantation_range: Tuple[float, float] = (0, 0)
@@ -337,7 +337,10 @@ class CommonLitModule(LightningModule):
         hidden_size = 0
         if self.cfg.linear_vocab_enable:
             hidden_size += self.cfg.linear_final_dim
-            input_size = self.bert.config.hidden_size
+            if self.cfg.nlp_model_name == "funnel-transformer/large-base":
+                input_size = self.bert.config.hidden_size / 2
+            else:
+                input_size = self.bert.config.hidden_size
             self.linear_vocab = nn.Sequential(
                 nn.Linear(input_size, self.cfg.linear_vocab_dim_1),
                 nn.Dropout(self.cfg.dropout),
@@ -346,20 +349,12 @@ class CommonLitModule(LightningModule):
                 nn.Dropout(self.cfg.dropout),
                 self.cfg.activation()
             )
-            if "large-base" in self.cfg.nlp_model_name:
-                self.linear_vocab_final = nn.Sequential(
-                    nn.Linear(self.cfg.linear_vocab_dim * self.cfg.max_length // 4, self.cfg.linear_final_dim),
-                    # nn.BatchNorm1d(self.cfg.linear_final_dim),
-                    self.cfg.activation(),
-                    nn.Dropout(self.cfg.dropout)
-                )
-            else:
-                self.linear_vocab_final = nn.Sequential(
-                    nn.Linear(self.cfg.linear_vocab_dim*self.cfg.max_length, self.cfg.linear_final_dim),
-                    # nn.BatchNorm1d(self.cfg.linear_final_dim),
-                    self.cfg.activation(),
-                    nn.Dropout(self.cfg.dropout)
-                )
+            self.linear_vocab_final = nn.Sequential(
+                nn.Linear(self.cfg.linear_vocab_dim*self.cfg.max_length, self.cfg.linear_final_dim),
+                # nn.BatchNorm1d(self.cfg.linear_final_dim),
+                self.cfg.activation(),
+                nn.Dropout(self.cfg.dropout)
+            )
         if self.cfg.self_attention_enable:
             hidden_size += self.cfg.linear_final_dim
             if self.cfg.cnn_model_name == "SimpleConv2D":
@@ -439,6 +434,7 @@ class CommonLitModule(LightningModule):
                 else:
                     lstm_size = int(self.bert.config.hidden_size * len(self.cfg.rnn_hidden_indice) * (
                                 self.cfg.rnn_module_shrink_ratio ** self.cfg.rnn_module_num))
+
             self.linear_lstm_final = nn.Sequential(
                 nn.Linear(lstm_size, self.cfg.linear_final_dim),
                 # nn.BatchNorm1d(self.cfg.linear_final_dim),
@@ -651,10 +647,6 @@ class CommonLitModule(LightningModule):
                 for layer in self.bert.encoder.layer[-self.cfg.reinit_layers:]:
                     for module in layer.modules():
                         self.bert._init_weights(module)
-            elif "layoutlm" in self.cfg.nlp_model_name:
-                for layer in self.bert.encoder.layer[-self.cfg.reinit_layers:]:
-                    for module in layer.modules():
-                        self.bert._init_weights(module)
         """
         for layer in [self.linear1, self.linear2, self.linear1_std, self.linear2_std, self.linear_perp, self.linear_vocab,
                       self.linear_tcn_final, self.linear_lstm_final, self.linear_hidden_final,
@@ -728,7 +720,7 @@ class CommonLitModule(LightningModule):
             elif "t5" in self.cfg.nlp_model_name:
                 x = [x[0], x[1], x[2]]
             elif "mpnet" in self.cfg.nlp_model_name:
-                x = [x[0], x[2], x[3], x[1]]
+                x = [x[0], x[1], x[2]]
             else:
                 x = [x[0], x[2], x[3], x[1]]
         elif "funnel" in self.cfg.nlp_model_name:
@@ -1165,50 +1157,22 @@ def main(cfg_original: Config,
                 rmse += model.best_rmse
 
                 if cfg.nlp_model_name in ["roberta-large",
-                                          "studio-ousia/luke-large"]:
-                    if fold == 0 and rmse > 0.465:
+                                          "studio-ousia/luke-large",
+                                          "google/electra-large-discriminator"]:
+                    if fold == 0 and rmse > 0.47:
                         break
-                    if fold == 1 and rmse / 2 > 0.463:
+                    if fold == 1 and rmse / 2 > 0.465:
                         break
-                    if fold == 2 and rmse / 3 > 0.4775:
-                        break
-
-                if cfg.nlp_model_name in ["google/electra-large-discriminator"]:
-                    if fold == 0 and rmse > 0.467:
-                        break
-                    if fold == 1 and rmse / 2 > 0.462:
+                    if fold == 2 and rmse / 3 > 0.482:
                         break
                 if cfg.nlp_model_name in ["funnel-transformer/large",
                                           "funnel-transformer/large-base"]:
                     if fold == 0 and rmse > 0.47:
                         break
-                if cfg.nlp_model_name in ["microsoft/deberta-large"]:
-                    if fold == 0 and rmse > 0.475:
-                        break
-                    if fold == 1 and rmse / 2 > 0.4675:
-                        break
-                    if fold == 2 and rmse / 3 > 0.484:
-                        break
                 if cfg.nlp_model_name in ["gpt2-medium"]:
                     if fold == 0 and rmse > 0.455:
                         break
                     if fold == 1 and rmse / 2 > 0.464:
-                        break
-                if cfg.nlp_model_name in ["microsoft/mpnet-base"]:
-                    if fold == 0 and rmse > 0.475:
-                        break
-                    if fold == 1 and rmse / 2 > 0.473:
-                        break
-                if cfg.nlp_model_name in ["funnel-transformer/large",
-                                          "funnel-transformer/xlarge-base"]:
-                    if fold == 0 and rmse > 0.463:
-                        break
-                    if fold == 1 and rmse / 2 > 0.462:
-                        break
-                if cfg.nlp_model_name in ["gpt2-large"]:
-                    if fold == 0 and rmse > 0.455:
-                        break
-                    if fold == 1 and rmse / 2 > 0.465:
                         break
                 del trainer, model, checkpoint_callback
                 gc.collect()
@@ -1229,7 +1193,7 @@ def config_large(cfg: Config, nlp_model_name: str):
 
 
 if __name__ == "__main__":
-    experiment_name = "gpt2-large"
+    experiment_name = "bart tune"
     folds = [0, 1, 2, 3, 4]
 
     def common_config(cfg) -> Config:
@@ -1240,27 +1204,17 @@ if __name__ == "__main__":
         cfg.feature_enable = True
         cfg.tcn_module_enable = False
         cfg.linear_vocab_enable = True
-        cfg.seed = 19900224
+        cfg.seed = 19920224
         cfg.rnn_module_num = 1
         cfg.simple_structure = False
         cfg.batch_size = 12
         cfg.epochs = 4
         cfg.epochs_max = 4
         cfg.warmup_ratio = 0.05
-
         if cfg.nlp_model_name == "gpt2-medium":
             cfg.reinit_layers = 6
+            cfg.gradient_clipping = 0.5
             cfg.hidden_stack_enable = False
-            cfg.epochs = 3
-            cfg.epochs_max = 3
-        if cfg.nlp_model_name == "gpt2-large":
-            cfg.reinit_layers = 6
-            cfg.lr_bert = 1e-5
-            cfg.hidden_stack_enable = False
-            cfg.batch_size = 4
-            cfg.linear_vocab_enable = False
-            cfg.epochs = 3
-            cfg.epochs_max = 3
         if cfg.nlp_model_name == "gpt2":
             cfg.batch_size = 32
         if cfg.nlp_model_name == "funnel-transformer/large-base":
@@ -1272,75 +1226,31 @@ if __name__ == "__main__":
             cfg.tcn_module_enable = False
             cfg.linear_vocab_enable = False
             cfg.rnn_module_num = 0
-            cfg.lr_bert = 15e-5
-            cfg.gradient_clipping = 0.5
-            cfg.batch_size = 4
-            cfg.weight_decay = 0
-            cfg.epochs = 6
-            cfg.epochs_max = 6
-        if cfg.nlp_model_name == "t5-base":
+            cfg.batch_size = 18
+        if cfg.nlp_model_name == "microsoft/mpnet-base":
             cfg.tcn_module_enable = False
             cfg.linear_vocab_enable = False
             cfg.rnn_module_num = 0
-            cfg.batch_size = 4
-            cfg.epochs = 6
-            cfg.epochs_max = 6
-        if cfg.nlp_model_name == "microsoft/mpnet-base":
-            cfg.reinit_layers = 2
-            cfg.gradient_clipping = 0.5
-            cfg.batch_size = 24
+            cfg.batch_size = 32
         if cfg.nlp_model_name == "google/electra-large-discriminator":
             cfg.lr_bert = 4e-5
-            cfg.reinit_layers = 2
-            cfg.multi_dropout_num = 1
-            cfg.multi_dropout_ratio = 0
-        if cfg.nlp_model_name == "studio-ousia/luke-large":
-            cfg.reinit_layers = 5
-        if cfg.nlp_model_name == "albert-large-v2":
-            cfg.reinit_layers = 0
-            cfg.rnn_module_num = 0
-        if cfg.nlp_model_name == "roberta-base":
-            cfg.batch_size = 24
-        if cfg.nlp_model_name == "funnel-transformer/xlarge-base":
-            cfg.epochs = 6
-            cfg.epochs_max = 6
-            cfg.multi_dropout_num = 1
-            cfg.multi_dropout_ratio = 0
-            cfg.rnn_hidden_indice = (-1, -2)
-        if cfg.nlp_model_name == "microsoft/deberta-xlarge":
-            cfg.reinit_layers = 4
-            cfg.lr_bert = 1e-5
-            cfg.batch_size = 4
-            cfg.linear_vocab_enable = False
-            cfg.epochs = 3
-            cfg.epochs_max = 3
+        if cfg.nlp_model_name == "google/electra-large-discriminator":
+            cfg.lr_bert = 4e-5
         return cfg
 
-
-    for nlp_model_name in ["t5-large"]:
-        for lr_bert in [15e-5]:
-            """
+    for nlp_model_name in ["gpt2-medium"]:
+        """
+        for reinit_layers in [5, 7]:
             cfg = Config(experiment_name=experiment_name)
             cfg.nlp_model_name = nlp_model_name
             cfg = common_config(cfg)
-            cfg.rnn_module_num = 1
-            cfg.lr_bert = lr_bert
+            cfg.reinit_layers = reinit_layers
             main(cfg, folds=folds)
-            for reinit_layers in [3, 6]:
-                cfg = Config(experiment_name=experiment_name)
-                cfg.nlp_model_name = nlp_model_name
-                cfg = common_config(cfg)
-                cfg.reinit_layers = reinit_layers
-                cfg.lr_bert = lr_bert
-                main(cfg, folds=folds)
-            """
-
-            for lr in [1e-3, 3e-3, 3e-4]:
-                cfg = Config(experiment_name=experiment_name)
-                cfg.nlp_model_name = nlp_model_name
-                cfg = common_config(cfg)
-                cfg.lr_bert = lr_bert
-                cfg.lr_fc = lr
-                cfg.lr_rnn = lr
-                cfg.lr_tcn = lr
-                main(cfg, folds=folds)
+        """
+        for gradient_clipping in [0.75]:
+            cfg = Config(experiment_name=experiment_name)
+            cfg.nlp_model_name = nlp_model_name
+            cfg = common_config(cfg)
+            cfg.hidden_stack_enable = True
+            cfg.gradient_clipping = gradient_clipping
+            main(cfg, folds=folds)

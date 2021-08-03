@@ -5,7 +5,7 @@ from torch.nn import functional as F
 from pytorch_lightning.core.lightning import LightningModule
 import pandas as pd
 import dataclasses
-from transformers import AutoTokenizer, AutoModel, AutoModelForMaskedLM, T5EncoderModel, T5Tokenizer
+from transformers import AutoTokenizer, AutoModel, AutoModelForMaskedLM
 import pytorch_lightning as pl
 from transformers import AdamW, get_linear_schedule_with_warmup
 from typing import Any
@@ -216,7 +216,7 @@ class Config:
     tcn_module_num: int = 3
     tcn_module: nn.Module = TemporalConvNet
     tcn_module_kernel_size: int = 4
-    tcn_module_dropout: float = 0
+    tcn_module_dropout: float = 0.2
 
     linear_vocab_enable: bool = False
     augmantation_range: Tuple[float, float] = (0, 0)
@@ -266,12 +266,10 @@ class Config:
     dropout_bert: float = 0
 
     feature_enable: bool = False
-    decoder_only: bool = True
+    bart_decoder_only: bool = True
 
     stochastic_weight_avg: bool = False
     val_check_interval: float = 0.05
-
-    attention_head_enable: bool = False
 
 class Lambda(nn.Module):
     def __init__(self, func):
@@ -280,23 +278,6 @@ class Lambda(nn.Module):
 
     def forward(self, x):
         return self.func(x)
-
-
-class AttentionHead(nn.Module):
-    def __init__(self, in_features, hidden_dim, num_targets):
-        super().__init__()
-        self.in_features = in_features
-
-        self.hidden_layer = nn.Linear(in_features, hidden_dim)
-        self.final_layer = nn.Linear(hidden_dim, num_targets)
-        self.out_features = hidden_dim
-
-    def forward(self, features):
-        att = torch.tanh(self.hidden_layer(features))
-        score = self.final_layer(att)
-        attention_weights = torch.softmax(score, dim=1)
-        return attention_weights
-
 
 class CommonLitModule(LightningModule):
     def __init__(self,
@@ -315,14 +296,8 @@ class CommonLitModule(LightningModule):
             if self.cfg.fine_tuned_path is not None:
                 self.bert = AutoModel.from_pretrained(self.cfg.fine_tuned_path)
             else:
-                if "t5" in self.cfg.nlp_model_name:
-                    self.bert = T5EncoderModel.from_pretrained(self.cfg.nlp_model_name)
-                else:
-                    self.bert = AutoModel.from_pretrained(self.cfg.nlp_model_name)
-        if "t5" in self.cfg.nlp_model_name:
-            self.tokenizer = T5Tokenizer.from_pretrained(self.cfg.nlp_model_name)
-        else:
-            self.tokenizer = AutoTokenizer.from_pretrained(self.cfg.nlp_model_name)
+                self.bert = AutoModel.from_pretrained(self.cfg.nlp_model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(self.cfg.nlp_model_name)
         if "gpt" in self.cfg.nlp_model_name:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
@@ -336,24 +311,19 @@ class CommonLitModule(LightningModule):
         # network cfg
         hidden_size = 0
         if self.cfg.linear_vocab_enable:
-            hidden_size += self.cfg.linear_final_dim
-            input_size = self.bert.config.hidden_size
-            self.linear_vocab = nn.Sequential(
-                nn.Linear(input_size, self.cfg.linear_vocab_dim_1),
-                nn.Dropout(self.cfg.dropout),
-                self.cfg.activation(),
-                nn.Linear(self.cfg.linear_vocab_dim_1, self.cfg.linear_vocab_dim),
-                nn.Dropout(self.cfg.dropout),
-                self.cfg.activation()
-            )
-            if "large-base" in self.cfg.nlp_model_name:
-                self.linear_vocab_final = nn.Sequential(
-                    nn.Linear(self.cfg.linear_vocab_dim * self.cfg.max_length // 4, self.cfg.linear_final_dim),
-                    # nn.BatchNorm1d(self.cfg.linear_final_dim),
-                    self.cfg.activation(),
-                    nn.Dropout(self.cfg.dropout)
-                )
+            if "funnel" in self.cfg.nlp_model_name:
+                print("funnelはlinear_vocab_enable無効です")
+                self.cfg.linear_vocab_enable = False
             else:
+                hidden_size += self.cfg.linear_final_dim
+                self.linear_vocab = nn.Sequential(
+                    nn.Linear(self.bert.config.hidden_size, self.cfg.linear_vocab_dim_1),
+                    nn.Dropout(self.cfg.dropout),
+                    self.cfg.activation(),
+                    nn.Linear(self.cfg.linear_vocab_dim_1, self.cfg.linear_vocab_dim),
+                    nn.Dropout(self.cfg.dropout),
+                    self.cfg.activation()
+                )
                 self.linear_vocab_final = nn.Sequential(
                     nn.Linear(self.cfg.linear_vocab_dim*self.cfg.max_length, self.cfg.linear_final_dim),
                     # nn.BatchNorm1d(self.cfg.linear_final_dim),
@@ -361,40 +331,44 @@ class CommonLitModule(LightningModule):
                     nn.Dropout(self.cfg.dropout)
                 )
         if self.cfg.self_attention_enable:
-            hidden_size += self.cfg.linear_final_dim
-            if self.cfg.cnn_model_name == "SimpleConv2D":
-                self.convnet = nn.Sequential(
-                    nn.Conv2d(self.bert.config.num_hidden_layers * self.bert.config.num_attention_heads,
-                              self.cfg.conv2d_hidden_channel, kernel_size=(1, 1), stride=(1, 1), bias=False),
-                    nn.ReLU(),
-                    nn.Conv2d(self.cfg.conv2d_hidden_channel,
-                              1, kernel_size=(1, 1), stride=(1, 1), bias=False),
-                    nn.ReLU(),
-                    Lambda(lambda x: x.view(x.size(0), -1)),
-                )
-                self.convnet.num_features = self.cfg.max_length ** 2
+            if "funnel" in self.cfg.nlp_model_name:
+                print("funnelはself_attention_enable無効です")
+                self.cfg.self_attention_enable = False
             else:
-                self.convnet = timm.create_model(self.cfg.cnn_model_name,
-                                                 pretrained=self.cfg.cnn_pretrained,
-                                                 num_classes=0)
-                if "swin" in self.cfg.cnn_model_name:
-                    self.convnet.patch_embed.proj = nn.Conv2d(
-                        self.bert.config.num_hidden_layers * self.bert.config.num_attention_heads,
-                        96, kernel_size=(4, 4), stride=(4, 4)
+                hidden_size += self.cfg.linear_final_dim
+                if self.cfg.cnn_model_name == "SimpleConv2D":
+                    self.convnet = nn.Sequential(
+                        nn.Conv2d(self.bert.config.num_hidden_layers * self.bert.config.num_attention_heads,
+                                  self.cfg.conv2d_hidden_channel, kernel_size=(1, 1), stride=(1, 1), bias=False),
+                        nn.ReLU(),
+                        nn.Conv2d(self.cfg.conv2d_hidden_channel,
+                                  1, kernel_size=(1, 1), stride=(1, 1), bias=False),
+                        nn.ReLU(),
+                        Lambda(lambda x: x.view(x.size(0), -1)),
                     )
-                if "vit" in self.cfg.cnn_model_name:
-                    self.convnet.patch_embed.proj = nn.Conv2d(
-                        self.bert.config.num_hidden_layers * self.bert.config.num_attention_heads,
-                        768, kernel_size=(32, 32), stride=(32, 32)
-                    )
-                if "efficientnet" in self.cfg.cnn_model_name:
-                    self.convnet.conv_stem = nn.Conv2d(
-                        self.bert.config.num_hidden_layers * self.bert.config.num_attention_heads,
-                        32, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
-                if "resnet" in self.cfg.cnn_model_name:
-                    self.convnet.conv1 = nn.Conv2d(
-                        self.bert.config.num_hidden_layers * self.bert.config.num_attention_heads,
-                        64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False)
+                    self.convnet.num_features = self.cfg.max_length ** 2
+                else:
+                    self.convnet = timm.create_model(self.cfg.cnn_model_name,
+                                                     pretrained=self.cfg.cnn_pretrained,
+                                                     num_classes=0)
+                    if "swin" in self.cfg.cnn_model_name:
+                        self.convnet.patch_embed.proj = nn.Conv2d(
+                            self.bert.config.num_hidden_layers * self.bert.config.num_attention_heads,
+                            96, kernel_size=(4, 4), stride=(4, 4)
+                        )
+                    if "vit" in self.cfg.cnn_model_name:
+                        self.convnet.patch_embed.proj = nn.Conv2d(
+                            self.bert.config.num_hidden_layers * self.bert.config.num_attention_heads,
+                            768, kernel_size=(32, 32), stride=(32, 32)
+                        )
+                    if "efficientnet" in self.cfg.cnn_model_name:
+                        self.convnet.conv_stem = nn.Conv2d(
+                            self.bert.config.num_hidden_layers * self.bert.config.num_attention_heads,
+                            32, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
+                    if "resnet" in self.cfg.cnn_model_name:
+                        self.convnet.conv1 = nn.Conv2d(
+                            self.bert.config.num_hidden_layers * self.bert.config.num_attention_heads,
+                            64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False)
 
             self.linear_conv_final = nn.Sequential(
                 nn.Linear(self.convnet.num_features, self.cfg.linear_final_dim),
@@ -410,41 +384,35 @@ class CommonLitModule(LightningModule):
                 self.cfg.activation(),
                 nn.Dropout(self.cfg.dropout)
             )
-        if self.cfg.attention_head_enable:
-            hidden_size += self.cfg.linear_final_dim
-            self.attention_head = nn.Sequential(
-                AttentionHead(self.bert.config.hidden_size, self.bert.config.hidden_size, 1),
-            )
-            self.linear_attention_head_final = nn.Sequential(
-                nn.Linear(self.bert.config.hidden_size, self.cfg.linear_final_dim),
-                # nn.BatchNorm1d(self.cfg.linear_final_dim),
-                self.cfg.activation(),
-                nn.Dropout(self.cfg.dropout)
-            )
         if self.cfg.rnn_module_num > 0:
-            hidden_size += self.cfg.linear_final_dim
-            self.lstm = self.make_lstm_module()
-            if self.cfg.bidirectional:
-                if self.cfg.word_axis:
-                    lstm_size = int(self.cfg.max_length * len(self.cfg.rnn_hidden_indice) * (
-                                (2 * self.cfg.rnn_module_shrink_ratio) ** self.cfg.rnn_module_num))
-                else:
-                    lstm_size = int(self.bert.config.hidden_size * len(self.cfg.rnn_hidden_indice) * (
-                                (2 * self.cfg.rnn_module_shrink_ratio) ** self.cfg.rnn_module_num))
+            if "funnel" in self.cfg.nlp_model_name:
+                print("funnelはrnn無効です")
+                self.cfg.rnn_module_num = 0
             else:
-                if self.cfg.word_axis:
-                    lstm_size = int(self.cfg.max_length * len(self.cfg.rnn_hidden_indice) * (
-                                self.cfg.rnn_module_shrink_ratio ** self.cfg.rnn_module_num))
-
+                hidden_size += self.cfg.linear_final_dim
+                self.lstm = self.make_lstm_module()
+                if self.cfg.bidirectional:
+                    if self.cfg.word_axis:
+                        lstm_size = int(self.cfg.max_length * len(self.cfg.rnn_hidden_indice) * (
+                                    (2 * self.cfg.rnn_module_shrink_ratio) ** self.cfg.rnn_module_num))
+                    else:
+                        lstm_size = int(self.bert.config.hidden_size * len(self.cfg.rnn_hidden_indice) * (
+                                    (2 * self.cfg.rnn_module_shrink_ratio) ** self.cfg.rnn_module_num))
                 else:
-                    lstm_size = int(self.bert.config.hidden_size * len(self.cfg.rnn_hidden_indice) * (
-                                self.cfg.rnn_module_shrink_ratio ** self.cfg.rnn_module_num))
-            self.linear_lstm_final = nn.Sequential(
-                nn.Linear(lstm_size, self.cfg.linear_final_dim),
-                # nn.BatchNorm1d(self.cfg.linear_final_dim),
-                self.cfg.activation(),
-                nn.Dropout(self.cfg.dropout)
-            )
+                    if self.cfg.word_axis:
+                        lstm_size = int(self.cfg.max_length * len(self.cfg.rnn_hidden_indice) * (
+                                    self.cfg.rnn_module_shrink_ratio ** self.cfg.rnn_module_num))
+
+                    else:
+                        lstm_size = int(self.bert.config.hidden_size * len(self.cfg.rnn_hidden_indice) * (
+                                    self.cfg.rnn_module_shrink_ratio ** self.cfg.rnn_module_num))
+
+                self.linear_lstm_final = nn.Sequential(
+                    nn.Linear(lstm_size, self.cfg.linear_final_dim),
+                    # nn.BatchNorm1d(self.cfg.linear_final_dim),
+                    self.cfg.activation(),
+                    nn.Dropout(self.cfg.dropout)
+                )
         if self.cfg.tcn_module_enable:
             hidden_size += self.cfg.linear_final_dim
             if self.cfg.word_axis:
@@ -621,7 +589,7 @@ class CommonLitModule(LightningModule):
                 for layer in self.bert.decoder.layers[-self.cfg.reinit_layers:]:
                     for module in layer.modules():
                         self.bert._init_weights(module)
-                if not self.cfg.decoder_only:
+                if not self.cfg.bart_decoder_only:
                     for layer in self.bert.encoder.layers[-self.cfg.reinit_layers:]:
                         for module in layer.modules():
                             self.bert._init_weights(module)
@@ -639,22 +607,6 @@ class CommonLitModule(LightningModule):
                     for module in layer.modules():
                         self.bert._init_weights(module)
 
-            elif "t5" in self.cfg.nlp_model_name:
-                for layer in self.bert.encoder.block[-self.cfg.reinit_layers:]:
-                    for module in layer.modules():
-                        self.bert._init_weights(module)
-                if not self.cfg.decoder_only:
-                    for layer in self.bert.decoder.block[-self.cfg.reinit_layers:]:
-                        for module in layer.modules():
-                            self.bert._init_weights(module)
-            elif "mpnet" in self.cfg.nlp_model_name:
-                for layer in self.bert.encoder.layer[-self.cfg.reinit_layers:]:
-                    for module in layer.modules():
-                        self.bert._init_weights(module)
-            elif "layoutlm" in self.cfg.nlp_model_name:
-                for layer in self.bert.encoder.layer[-self.cfg.reinit_layers:]:
-                    for module in layer.modules():
-                        self.bert._init_weights(module)
         """
         for layer in [self.linear1, self.linear2, self.linear1_std, self.linear2_std, self.linear_perp, self.linear_vocab,
                       self.linear_tcn_final, self.linear_lstm_final, self.linear_hidden_final,
@@ -722,13 +674,9 @@ class CommonLitModule(LightningModule):
             elif "funnel" in self.cfg.nlp_model_name:
                 x = [x[0], x[1], x[2]]
             elif "bart" in self.cfg.nlp_model_name:
-                x = [x[0], x[2], x[3], None]  # x[2]: decoder hidden_states, x[3]: cross attention
+                x = [x[0], x[2], x[3], None, x[6]]  # x[2]: decoder hidden_states, x[3]: cross attention, x[6]: encoder hidden_states
             elif "electra" in self.cfg.nlp_model_name:
                 x = [x[0], x[1], x[2]]
-            elif "t5" in self.cfg.nlp_model_name:
-                x = [x[0], x[1], x[2]]
-            elif "mpnet" in self.cfg.nlp_model_name:
-                x = [x[0], x[2], x[3], x[1]]
             else:
                 x = [x[0], x[2], x[3], x[1]]
         elif "funnel" in self.cfg.nlp_model_name:
@@ -807,7 +755,10 @@ class CommonLitModule(LightningModule):
                 if "funnel" in self.cfg.nlp_model_name:
                     xx = torch.stack([self.dropout_bert_stack(xx) for xx in x[1][-3:]]).mean(dim=[0, 2])
                 else:
-                    xx = torch.stack([self.dropout_bert_stack(xx) for xx in x[1][-4:]]).mean(dim=0)
+                    if "bart" in self.cfg.nlp_model_name and not cfg.bart_decoder_only:
+                        xx = torch.stack([self.dropout_bert_stack(xx) for xx in x[1][-4:] + x[4][-4:]]).mean(dim=0)
+                    else:
+                        xx = torch.stack([self.dropout_bert_stack(xx) for xx in x[1][-4:]]).mean(dim=0)
                     xx = torch.sum(
                         xx * attention_mask.unsqueeze(-1), dim=1, keepdim=False
                     )
@@ -823,11 +774,6 @@ class CommonLitModule(LightningModule):
                 x_lstm = self.lstm(torch.cat([x[1][idx] for idx in self.cfg.rnn_hidden_indice], dim=2)).mean(dim=1)
             x_lstm = self.linear_lstm_final(x_lstm)
             x_bert.append(x_lstm)
-        if self.cfg.attention_head_enable:
-            weights_attn = self.attention_head(x[0])
-            x_attn = torch.sum(weights_attn * x[0], dim=1)
-            x_attn = self.linear_attention_head_final(x_attn)
-            x_bert.append(x_attn)
         if self.cfg.tcn_module_enable:
             if self.cfg.word_axis:
                 x_tcn = self.tcn(self.dropout(x[0])).mean(dim=1)
@@ -1053,11 +999,7 @@ class CommonLitModule(LightningModule):
             params.append(extract_params(self.linear1_std.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
             params.append(extract_params(self.linear2_std.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
             params.append(extract_params(self.linear2_std.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
-        if self.cfg.attention_head_enable:
-            params.append(extract_params(self.attention_head.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
-            params.append(extract_params(self.attention_head.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
-            params.append(extract_params(self.linear_attention_head_final.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
-            params.append(extract_params(self.linear_attention_head_final.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
+
         if self.cfg.pooler_enable:
             params.append(extract_params(self.bert.pooler.named_parameters(), lr=self.cfg.lr_fc, weight_decay=self.cfg.weight_decay, no_decay=False))
             params.append(extract_params(self.bert.pooler.named_parameters(), lr=self.cfg.lr_fc, weight_decay=0, no_decay=True))
@@ -1164,49 +1106,23 @@ def main(cfg_original: Config,
                     break
                 rmse += model.best_rmse
 
-                if cfg.nlp_model_name in ["roberta-large",
-                                          "studio-ousia/luke-large"]:
-                    if fold == 0 and rmse > 0.465:
-                        break
-                    if fold == 1 and rmse / 2 > 0.463:
-                        break
-                    if fold == 2 and rmse / 3 > 0.4775:
-                        break
-
+                if cfg.nlp_model_name in ["roberta-large", "studio-ousia/luke-large"]:
+                    if cfg.epochs == 6:
+                        if fold == 0 and rmse > 0.47:
+                            break
+                        if fold == 1 and rmse / 2 > 0.465:
+                            break
+                        if fold == 2 and rmse / 3 > 0.48:
+                            break
+                        if fold == 3 and rmse / 4 > 0.474:
+                            break
+                    else:
+                        if fold == 0 and rmse > 0.47:
+                            break
+                        if fold == 1 and rmse / 2 > 0.465:
+                            break
                 if cfg.nlp_model_name in ["google/electra-large-discriminator"]:
-                    if fold == 0 and rmse > 0.467:
-                        break
-                    if fold == 1 and rmse / 2 > 0.462:
-                        break
-                if cfg.nlp_model_name in ["funnel-transformer/large",
-                                          "funnel-transformer/large-base"]:
                     if fold == 0 and rmse > 0.47:
-                        break
-                if cfg.nlp_model_name in ["microsoft/deberta-large"]:
-                    if fold == 0 and rmse > 0.475:
-                        break
-                    if fold == 1 and rmse / 2 > 0.4675:
-                        break
-                    if fold == 2 and rmse / 3 > 0.484:
-                        break
-                if cfg.nlp_model_name in ["gpt2-medium"]:
-                    if fold == 0 and rmse > 0.455:
-                        break
-                    if fold == 1 and rmse / 2 > 0.464:
-                        break
-                if cfg.nlp_model_name in ["microsoft/mpnet-base"]:
-                    if fold == 0 and rmse > 0.475:
-                        break
-                    if fold == 1 and rmse / 2 > 0.473:
-                        break
-                if cfg.nlp_model_name in ["funnel-transformer/large",
-                                          "funnel-transformer/xlarge-base"]:
-                    if fold == 0 and rmse > 0.463:
-                        break
-                    if fold == 1 and rmse / 2 > 0.462:
-                        break
-                if cfg.nlp_model_name in ["gpt2-large"]:
-                    if fold == 0 and rmse > 0.455:
                         break
                     if fold == 1 and rmse / 2 > 0.465:
                         break
@@ -1229,7 +1145,7 @@ def config_large(cfg: Config, nlp_model_name: str):
 
 
 if __name__ == "__main__":
-    experiment_name = "gpt2-large"
+    experiment_name = "gpt-medium tune"
     folds = [0, 1, 2, 3, 4]
 
     def common_config(cfg) -> Config:
@@ -1240,107 +1156,21 @@ if __name__ == "__main__":
         cfg.feature_enable = True
         cfg.tcn_module_enable = False
         cfg.linear_vocab_enable = True
-        cfg.seed = 19900224
+        cfg.seed = 19900222
         cfg.rnn_module_num = 1
         cfg.simple_structure = False
         cfg.batch_size = 12
         cfg.epochs = 4
         cfg.epochs_max = 4
         cfg.warmup_ratio = 0.05
-
-        if cfg.nlp_model_name == "gpt2-medium":
-            cfg.reinit_layers = 6
-            cfg.hidden_stack_enable = False
-            cfg.epochs = 3
-            cfg.epochs_max = 3
-        if cfg.nlp_model_name == "gpt2-large":
-            cfg.reinit_layers = 6
-            cfg.lr_bert = 1e-5
-            cfg.hidden_stack_enable = False
-            cfg.batch_size = 4
-            cfg.linear_vocab_enable = False
-            cfg.epochs = 3
-            cfg.epochs_max = 3
-        if cfg.nlp_model_name == "gpt2":
-            cfg.batch_size = 32
-        if cfg.nlp_model_name == "funnel-transformer/large-base":
-            cfg.rnn_hidden_indice = (-1, -2)
-        if cfg.nlp_model_name == "funnel-transformer/large":
-            cfg.epochs = 6
-            cfg.epochs_max = 6
-        if cfg.nlp_model_name == "t5-large":
-            cfg.tcn_module_enable = False
-            cfg.linear_vocab_enable = False
-            cfg.rnn_module_num = 0
-            cfg.lr_bert = 15e-5
-            cfg.gradient_clipping = 0.5
-            cfg.batch_size = 4
-            cfg.weight_decay = 0
-            cfg.epochs = 6
-            cfg.epochs_max = 6
-        if cfg.nlp_model_name == "t5-base":
-            cfg.tcn_module_enable = False
-            cfg.linear_vocab_enable = False
-            cfg.rnn_module_num = 0
-            cfg.batch_size = 4
-            cfg.epochs = 6
-            cfg.epochs_max = 6
-        if cfg.nlp_model_name == "microsoft/mpnet-base":
-            cfg.reinit_layers = 2
-            cfg.gradient_clipping = 0.5
-            cfg.batch_size = 24
-        if cfg.nlp_model_name == "google/electra-large-discriminator":
-            cfg.lr_bert = 4e-5
-            cfg.reinit_layers = 2
-            cfg.multi_dropout_num = 1
-            cfg.multi_dropout_ratio = 0
-        if cfg.nlp_model_name == "studio-ousia/luke-large":
-            cfg.reinit_layers = 5
-        if cfg.nlp_model_name == "albert-large-v2":
-            cfg.reinit_layers = 0
-            cfg.rnn_module_num = 0
-        if cfg.nlp_model_name == "roberta-base":
-            cfg.batch_size = 24
-        if cfg.nlp_model_name == "funnel-transformer/xlarge-base":
-            cfg.epochs = 6
-            cfg.epochs_max = 6
-            cfg.multi_dropout_num = 1
-            cfg.multi_dropout_ratio = 0
-            cfg.rnn_hidden_indice = (-1, -2)
-        if cfg.nlp_model_name == "microsoft/deberta-xlarge":
-            cfg.reinit_layers = 4
-            cfg.lr_bert = 1e-5
-            cfg.batch_size = 4
-            cfg.linear_vocab_enable = False
-            cfg.epochs = 3
-            cfg.epochs_max = 3
         return cfg
 
-
-    for nlp_model_name in ["t5-large"]:
-        for lr_bert in [15e-5]:
-            """
+    for nlp_model_name in ["gpt2-medium"]:
+        for lr_bert in [2.5e-5, 3.5e-5]:
             cfg = Config(experiment_name=experiment_name)
-            cfg.nlp_model_name = nlp_model_name
             cfg = common_config(cfg)
-            cfg.rnn_module_num = 1
             cfg.lr_bert = lr_bert
+            cfg.reinit_layers = 6
+            cfg.nlp_model_name = nlp_model_name
             main(cfg, folds=folds)
-            for reinit_layers in [3, 6]:
-                cfg = Config(experiment_name=experiment_name)
-                cfg.nlp_model_name = nlp_model_name
-                cfg = common_config(cfg)
-                cfg.reinit_layers = reinit_layers
-                cfg.lr_bert = lr_bert
-                main(cfg, folds=folds)
-            """
 
-            for lr in [1e-3, 3e-3, 3e-4]:
-                cfg = Config(experiment_name=experiment_name)
-                cfg.nlp_model_name = nlp_model_name
-                cfg = common_config(cfg)
-                cfg.lr_bert = lr_bert
-                cfg.lr_fc = lr
-                cfg.lr_rnn = lr
-                cfg.lr_tcn = lr
-                main(cfg, folds=folds)

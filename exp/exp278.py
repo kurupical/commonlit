@@ -1256,11 +1256,11 @@ if __name__ == "__main__":
         if cfg.nlp_model_name == "gpt2-large":
             cfg.reinit_layers = 6
             cfg.lr_bert = 1e-5
-            cfg.hidden_stack_enable = False
             cfg.batch_size = 4
             cfg.linear_vocab_enable = False
             cfg.epochs = 3
             cfg.epochs_max = 3
+            cfg.gradient_clipping = 0.5
         if cfg.nlp_model_name == "gpt2":
             cfg.batch_size = 32
         if cfg.nlp_model_name == "funnel-transformer/large-base":
@@ -1305,8 +1305,14 @@ if __name__ == "__main__":
             cfg = common_config(cfg)
             cfg.lr_bert = lr_bert
             main(cfg, folds=folds)
-        """
         for reinit_layers in [4, 5, 7]:
+            cfg = Config(experiment_name=experiment_name)
+            cfg.nlp_model_name = nlp_model_name
+            cfg = common_config(cfg)
+            cfg.reinit_layers = reinit_layers
+            main(cfg, folds=folds)
+        """
+        for reinit_layers in [3, 7]:
             cfg = Config(experiment_name=experiment_name)
             cfg.nlp_model_name = nlp_model_name
             cfg = common_config(cfg)
